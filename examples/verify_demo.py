@@ -36,15 +36,17 @@ def demo_dry_run():
         onnx_path=onnx_path,
         save_dir=save_dir,
         threshold=1e-3,
-        min_nodes=20,
-        memory_budget_mb=512,
+        min_nodes=20,                 # leaf threshold: smaller → stop splitting
+        nodes_per_subgraph=200,       # partition target: subgraph size
+        memory_budget_mb=512,         # S1 memory limit for ORT dump
     )
 
-    print(f"ONNX         : {onnx_path}")
-    print(f"Output       : {save_dir}")
-    print(f"Threshold    : {verifier.threshold}")
-    print(f"Min nodes    : {verifier.min_nodes}")
-    print(f"Precision    : {verifier.precision}")
+    print(f"ONNX              : {onnx_path}")
+    print(f"Output            : {save_dir}")
+    print(f"Threshold         : {verifier.threshold}")
+    print(f"Leaf threshold    : {verifier.min_nodes} nodes")
+    print(f"Partition target  : {verifier.nodes_per_subgraph} nodes/subgraph")
+    print(f"Precision         : {verifier.precision}")
     print()
     print("Pipeline steps:")
     print("  S1: DumpBuilder → dump_*.onnx → ORTRunner cascade dump")
@@ -53,8 +55,9 @@ def demo_dry_run():
     print("  S2.5: Full-model output comparison → skip subgraphs if match")
     print()
     print("  S3: BFS subgraph verification (dataflow-ordered, cache-aware)")
-    print("       TRTPartitioner.split(nodes_per_subgraph=20)")
+    print("       TRTPartitioner.split(nodes_per_subgraph=200)")
     print("         → split/subgraph_*.onnx")
+    print("       Leaf threshold: 20 nodes (smaller → stop splitting)")
     print("       For each subgraph:")
     print("         → check verify_cache.json (skip if fp matches)")
     print("         → TRTBuilder.build(save_debug_tensors=True)")

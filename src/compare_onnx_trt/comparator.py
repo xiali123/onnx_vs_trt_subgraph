@@ -126,6 +126,7 @@ class LayerComparator:
         shape_mismatch = 0
         missing_trt = 0
         missing_onnx = 0
+        dtype_conflict = 0
         skipped = 0
 
         for layer in self._mapper.layers:
@@ -195,6 +196,20 @@ class LayerComparator:
                 onnx_data = np.load(onnx_path_full)
                 self._npy_cache[onnx_path_full] = onnx_data
 
+            trt_is_int = np.issubdtype(trt_data.dtype, np.integer)
+            onnx_is_int = np.issubdtype(onnx_data.dtype, np.integer)
+
+            # detect implausible pairings: integer vs float → likely name mismatch
+            if trt_is_int != onnx_is_int:
+                dtype_conflict += 1
+                row["status"] = "dtype_conflict"
+                row["trt_dtype"] = str(trt_data.dtype)
+                row["onnx_dtype"] = str(onnx_data.dtype)
+                row["trt_shape"] = str(trt_data.shape)
+                row["onnx_shape"] = str(onnx_data.shape)
+                rows.append(row)
+                continue
+
             if trt_data.shape != onnx_data.shape:
                 shape_mismatch += 1
                 row.update({
@@ -211,6 +226,41 @@ class LayerComparator:
                 rows.append(row)
                 continue
 
+            # integer tensors: exact comparison
+            if trt_is_int:
+                trt_flat = trt_data.ravel()
+                onnx_flat = onnx_data.ravel()
+                exact_match = bool(np.array_equal(trt_data, onnx_data))
+                mismatch_count = int(np.sum(trt_flat != onnx_flat))
+                max_ad = float(np.abs(trt_flat.astype(np.int64) -
+                                       onnx_flat.astype(np.int64)).max())
+                matched += 1
+                row.update({
+                    "status": "ok",
+                    "max_abs_diff": max_ad,
+                    "mean_abs_diff": float(mismatch_count) / max(trt_data.size, 1),
+                    "relative_diff": float(mismatch_count) / max(trt_data.size, 1),
+                    "cosine_sim": 1.0 if exact_match else 0.0,
+                    "allclose_1e-3": exact_match,
+                    "allclose_1e-5": exact_match,
+                    "shape": str(trt_data.shape),
+                    "trt_dtype": str(trt_data.dtype),
+                    "onnx_dtype": str(onnx_data.dtype),
+                    "num_elements": int(trt_data.size),
+                    "trt_min": int(trt_flat.min()),
+                    "trt_max": int(trt_flat.max()),
+                    "trt_mean": float(trt_flat.mean()),
+                    "onnx_min": int(onnx_flat.min()),
+                    "onnx_max": int(onnx_flat.max()),
+                    "onnx_mean": float(onnx_flat.mean()),
+                    "mismatch_count": mismatch_count,
+                    "onnx_file": onnx_file,
+                    "trt_file": trt_file,
+                })
+                rows.append(row)
+                continue
+
+            # float tensors: tolerance-based comparison
             diff = trt_data.astype(np.float64) - onnx_data.astype(np.float64)
             abs_diff = np.abs(diff)
 
@@ -236,7 +286,8 @@ class LayerComparator:
                 "allclose_1e-3": bool(np.allclose(trt_data, onnx_data, atol=1e-3)),
                 "allclose_1e-5": bool(np.allclose(trt_data, onnx_data, atol=1e-5)),
                 "shape": str(trt_data.shape),
-                "dtype": str(trt_data.dtype),
+                "trt_dtype": str(trt_data.dtype),
+                "onnx_dtype": str(onnx_data.dtype),
                 "num_elements": int(trt_data.size),
                 "trt_min": float(trt_flat.min()),
                 "trt_max": float(trt_flat.max()),
@@ -256,6 +307,7 @@ class LayerComparator:
                 "total_layers": len(self._mapper.layers),
                 "compared": matched,
                 "skipped_unmapped": skipped,
+                "dtype_conflict": dtype_conflict,
                 "shape_mismatch": shape_mismatch,
                 "missing_trt_dump": missing_trt,
                 "missing_onnx_dump": missing_onnx,

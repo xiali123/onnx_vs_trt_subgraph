@@ -737,10 +737,17 @@ class TRTVerifier:
         split_dir = os.path.join(sub_dir, "split")
         os.makedirs(split_dir, exist_ok=True)
 
+        # parent node count — used to detect no-progress splits (infinite loop guard)
+        try:
+            parent_node_count = len(onnx.load(onnx_path).graph.node)
+        except Exception:
+            parent_node_count = 0
+
         # A. partition
         try:
             partitioner = TRTPartitioner(onnx_path, layer_info_path)
-            partitioner.split(save_dir=split_dir, nodes_per_subgraph=self.min_nodes)
+            partitioner.split(save_dir=split_dir,
+                              nodes_per_subgraph=self.nodes_per_subgraph or self.min_nodes)
         except Exception as e:
             logger.error("[verify:%d] partition failed: %s", depth, e)
             report.errors.append({
@@ -786,12 +793,19 @@ class TRTVerifier:
             fp = self._cache_fingerprint(sub_onnx, node_count)
             cached = self._cache_hit(cache_key, fp) if fp else None
 
+            # a subgraph that matches the parent size cannot be split further
+            can_split = node_count < parent_node_count
+            if not can_split and node_count >= self.min_nodes:
+                logger.warning("[verify:%d.%d] split did not reduce size "
+                               "(%d == parent %d) — forcing leaf",
+                               depth, i, node_count, parent_node_count)
+
             if cached:
                 logger.info("[verify:%d.%d] cached (%s) — skip", depth, i,
                             cached.get("status"))
                 if cached["status"] == "passed":
                     report.passed.append(cached.get("entry", {}))
-                elif cached["status"] == "queued":
+                elif cached["status"] == "queued" and can_split:
                     retry_list.append((sub_onnx, i))
                 else:
                     report.failed.append(cached.get("entry", {}))
@@ -819,7 +833,7 @@ class TRTVerifier:
                 report.passed.append(entry)
                 self._cleanup_verify_dir(verify_dir)
                 status = "passed"
-            elif node_count >= self.min_nodes:
+            elif node_count >= self.min_nodes and can_split:
                 logger.info("[verify:%d.%d] queued for deeper verification", depth, i)
                 retry_list.append((sub_onnx, i))
                 self._cleanup_verify_dir(verify_dir)
@@ -890,11 +904,13 @@ class TRTVerifier:
         )
         builder.set_working_dir(verify_dir)
 
-        # build TRT engine with debug tensors for per-layer comparison
+        # build TRT engine: debug tensors (per-layer) + export output (final outputs)
+        export_output = os.path.join(verify_dir, "sub_output.json")
         try:
             builder.build(
                 load_inputs=load_inputs,
                 save_debug_tensors=True,
+                export_output=export_output,
             )
         except RuntimeError as e:
             logger.error("[verify:%d.%d] TRT build failed: %s", depth, idx, e)
@@ -905,7 +921,7 @@ class TRTVerifier:
             })
             return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
-        # per-layer comparison (both leaf and non-leaf)
+        # per-layer comparison (intermediate tensors via debug dump)
         try:
             trt_mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=gt_dir)
             comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir,
@@ -935,6 +951,22 @@ class TRTVerifier:
             })
             return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
+        # final output comparison (network outputs may not be in debug tensors)
+        output_max_diff = 0.0
+        if os.path.exists(export_output):
+            try:
+                trt_outputs = _parse_trt_export_output(export_output)
+                output_max_diff, output_errors = _compare_outputs(
+                    sub_onnx, gt_dir, trt_outputs, strict=False)
+                summary["output_max_diff"] = output_max_diff
+                summary["output_errors"] = len(output_errors)
+            except Exception as e:
+                logger.debug("[verify:%d.%d] output compare skipped: %s", depth, idx, e)
+                summary["output_max_diff"] = None
+                summary["output_errors"] = 0
+
+        max_diff = max(max_diff, output_max_diff)
+
         entry = {
             "depth": depth,
             "idx": idx,
@@ -942,6 +974,7 @@ class TRTVerifier:
             "node_count": node_count,
             "is_leaf": is_leaf,
             "max_abs_diff": max_diff,
+            "output_max_diff": output_max_diff,
             "summary": summary,
             "sub_layer_info": sub_layer_info,
             "comparison": comparison_path,
