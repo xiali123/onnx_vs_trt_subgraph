@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from functools import lru_cache
 import numpy as np
 from dataclasses import dataclass, field
 from onnx_trt_map import LayerMapper
@@ -58,6 +59,7 @@ class LayerComparator:
     # ── name resolution helpers ──
 
     @staticmethod
+    @lru_cache(maxsize=4096)
     def _safe_name(tensor_name):
         s = LayerComparator._SAFE_RE_ILLEGAL.sub("_", tensor_name)
         return LayerComparator._SAFE_RE_COLLAPSE.sub("_", s)

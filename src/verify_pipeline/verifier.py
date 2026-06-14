@@ -276,6 +276,64 @@ class TRTVerifier:
         self.input_dict = input_dict
 
         self._report = None
+        self._cache = {}
+        self._cache_hits = 0
+
+    # ── cache ──
+
+    @property
+    def _cache_path(self):
+        return os.path.join(self.save_dir, "verify_cache.json")
+
+    def _cache_header(self):
+        """Return a fingerprint dict for this run — any change invalidates the cache."""
+        return {
+            "model": self.onnx_path,
+            "threshold": self.threshold,
+            "min_nodes": self.min_nodes,
+            "precision": self.precision,
+        }
+
+    def _load_cache(self):
+        path = self._cache_path
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    self._cache = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning("corrupt cache — starting fresh")
+                self._cache = {}
+        if not self._cache or self._cache.get("_header") != self._cache_header():
+            logger.info("cache header mismatch or missing — fresh cache")
+            self._cache = {"_header": self._cache_header(), "subgraphs": {}}
+            self._cache_hits = 0
+        else:
+            self._cache_hits = len(self._cache.get("subgraphs", {}))
+            logger.info("cache loaded: %d subgraph entries, header matches", self._cache_hits)
+
+    def _save_cache(self):
+        """Atomic write: temp file + rename to avoid corruption on crash."""
+        tmp = self._cache_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._cache, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self._cache_path)
+
+    def _cache_key(self, depth, idx):
+        return f"depth_{depth}/sub_{idx}"
+
+    def _cache_fingerprint(self, onnx_path, node_count):
+        """File fingerprint: [file_size, node_count] (no ONNX load)."""
+        try:
+            return [os.stat(onnx_path).st_size, node_count]
+        except Exception:
+            return None
+
+    def _cache_hit(self, cache_key, fingerprint):
+        """Check cache for subgraph; returns cached entry or None."""
+        cached = self._cache.get("subgraphs", {}).get(cache_key)
+        if cached and cached.get("_fp") == fingerprint:
+            return cached
+        return None
 
     # ── public ──
 
@@ -304,16 +362,28 @@ class TRTVerifier:
     def run(self):
         os.makedirs(self.save_dir, exist_ok=True)
         self._setup_logging()
+        self._load_cache()
         logger.info("verify pipeline start — %s", self.onnx_path)
 
         gt_dir = os.path.join(self.save_dir, "ground_truth")
 
-        # S1: full ONNX ORT dump
-        self._step_full_ort_dump(gt_dir, self.input_dict)
+        # S1: full ONNX ORT dump (skip if cached marker and output exist)
+        if self._cache.get("s1_ground_truth") and os.path.exists(
+                os.path.join(gt_dir, "name_mapping.json")):
+            logger.info("[S1] ground truth already cached — skip")
+        else:
+            self._step_full_ort_dump(gt_dir, self.input_dict)
+            self._cache["s1_ground_truth"] = True
+            self._save_cache()
 
         # S2: full ONNX → TRT + layer info
         full_layer_info = os.path.join(self.save_dir, "full_layers.json")
-        self._step_full_trt_convert(full_layer_info)
+        if self._cache.get("s2_full_trt") and os.path.exists(full_layer_info):
+            logger.info("[S2] full TRT already cached — skip")
+        else:
+            self._step_full_trt_convert(full_layer_info)
+            self._cache["s2_full_trt"] = True
+            self._save_cache()
 
         report = VerifyReport(threshold=self.threshold)
 
@@ -681,6 +751,22 @@ class TRTVerifier:
             logger.info("[verify:%d.%d] %s: %d nodes",
                         depth, i, os.path.basename(sub_onnx), node_count)
 
+            # ── cache lookup (fingerprint = file_size + node_count) ──
+            cache_key = self._cache_key(depth, i)
+            fp = self._cache_fingerprint(sub_onnx, node_count)
+            cached = self._cache_hit(cache_key, fp) if fp else None
+
+            if cached:
+                logger.info("[verify:%d.%d] cached (%s) — skip", depth, i,
+                            cached.get("status"))
+                if cached["status"] == "passed":
+                    report.passed.append(cached.get("entry", {}))
+                elif cached["status"] == "queued":
+                    retry_list.append((sub_onnx, i))
+                else:
+                    report.failed.append(cached.get("entry", {}))
+                continue
+
             try:
                 passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report,
                                                  node_count)
@@ -696,19 +782,28 @@ class TRTVerifier:
             verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
                                       f"verify_sub_{i}")
 
+            # ── update cache ──
+            cache_entry = {k: v for k, v in entry.items()
+                           if k not in ("top_errors",)}
             if passed:
                 report.passed.append(entry)
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
+                status = "passed"
             elif node_count >= self.min_nodes:
                 logger.info("[verify:%d.%d] queued for deeper verification", depth, i)
                 retry_list.append((sub_onnx, i))
-                # 非叶子：删除 npy/engine，保留 sub_layer_info 给更深层用
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=True)
+                status = "queued"
             else:
                 report.failed.append(entry)
-                # 叶子失败：保留所有 npy + engine 用于排查
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=True,
                                          keep_dump=True)
+                status = "failed"
+
+            self._cache.setdefault("subgraphs", {})[cache_key] = {
+                "_fp": fp, "status": status,
+                "max_abs_diff": entry.get("max_abs_diff"), "entry": cache_entry}
+            self._save_cache()
 
         # C. BFS: recurse into all queued subgraphs
         for sub_onnx, idx in retry_list:
