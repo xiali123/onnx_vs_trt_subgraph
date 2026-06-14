@@ -1,0 +1,1 @@
+from subgraph_split_by_trt.splitter import TRTPartitioner
