@@ -3,13 +3,15 @@ Demo: TRTVerifier — ONNX vs TRT precision verification pipeline.
 
 Requires: trtexec + onnxruntime
 Usage:
-    python verify_demo.py                # dry-run: show what would happen
-    python verify_demo.py --real         # real run (needs trtexec)
+    python verify_demo.py                              # dry-run
+    python verify_demo.py --real                       # real run (needs trtexec)
     python verify_demo.py --real --onnx path/to/model.onnx
+    python verify_demo.py --real --pkl path/to/inputs.pkl   # 真值输入
 """
 import os
 import sys
 import argparse
+import pickle
 import time
 import tempfile
 
@@ -75,11 +77,18 @@ def demo_dry_run():
     print(f"    reports/verify_report.json")
 
 
-def demo_real(onnx_path):
+def demo_real(onnx_path, pkl_path=None):
     """Run the full pipeline."""
     print("=" * 60)
     print("REAL RUN: TRTVerifier pipeline")
     print("=" * 60)
+
+    input_dict = None
+    if pkl_path:
+        print(f"Loading ground-truth inputs from: {pkl_path}")
+        with open(pkl_path, "rb") as f:
+            input_dict = pickle.load(f)
+        print(f"  {len(input_dict)} input tensors loaded")
 
     save_dir = os.path.join(THIS_DIR, "verify_out_v3")
 
@@ -90,7 +99,7 @@ def demo_real(onnx_path):
         min_nodes=500,
         memory_budget_mb=512,
         verbose=True,
-        # input_dict={"input": np.load("real_input.npy")},  # 初始真值输入，不传则随机生成
+        input_dict=input_dict,
     )
 
     t0 = time.time()
@@ -149,6 +158,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--real", action="store_true", help="Actually run trtexec")
     parser.add_argument("--onnx", default=None, help="Path to ONNX model (default: tiny_test.onnx)")
+    parser.add_argument("--pkl", default=None, help="Path to pickle file with ground-truth inputs {name: ndarray}")
     args = parser.parse_args()
 
     if args.real:
@@ -157,6 +167,9 @@ if __name__ == "__main__":
             print(f"ONNX model not found: {onnx_path}")
             print("Run create_onnx.py first or specify --onnx <path>")
             sys.exit(1)
-        sys.exit(demo_real(onnx_path))
+        if args.pkl and not os.path.exists(args.pkl):
+            print(f"Pickle file not found: {args.pkl}")
+            sys.exit(1)
+        sys.exit(demo_real(onnx_path, args.pkl))
     else:
         demo_dry_run()
