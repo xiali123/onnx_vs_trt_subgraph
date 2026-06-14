@@ -131,6 +131,48 @@ def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
     return path
 
 
+def _parse_trt_export_output(json_path):
+    """Parse trtexec --exportOutput JSON into {name: ndarray}.
+
+    trtexec output format:
+      [{"name": "out", "dimensions": "1x10", "values": [nan, 0.1, ...]}]
+    Note: trtexec may emit NaN/Inf as bare identifiers (invalid JSON), so we
+    sanitise the raw text before parsing.
+    """
+    with open(json_path) as f:
+        raw_text = f.read()
+
+    # trtexec writes nan / inf / -inf as bare identifiers → not valid JSON
+    raw_text = re.sub(r'\bnan\b', '"__NaN__"', raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r'\binf\b', '"__Inf__"', raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r'\b-inf\b', '"__-Inf__"', raw_text, flags=re.IGNORECASE)
+
+    raw = json.loads(raw_text)
+
+    result = {}
+    for entry in raw:
+        name = entry["name"]
+        dims_str = entry.get("dimensions", "")
+        shape = [int(d) for d in dims_str.split("x")] if dims_str else []
+        raw_values = entry.get("values", [])
+
+        values = []
+        for v in raw_values:
+            if v == "__NaN__":
+                values.append(np.nan)
+            elif v == "__Inf__":
+                values.append(np.inf)
+            elif v == "__-Inf__":
+                values.append(-np.inf)
+            else:
+                values.append(v)
+
+        arr = np.array(values, dtype=np.float32).reshape(shape)
+        result[name] = arr
+
+    return result
+
+
 @dataclass
 class VerifyReport:
     passed: list = field(default_factory=list)
@@ -247,7 +289,7 @@ class TRTVerifier:
 
         model = GraphModel(self.onnx_path)
         builder = DumpBuilder(model, AllTensorSelector())
-        if self.nodes_per_subgraph is not None:
+        if self.nodes_per_subgraph is not None and self.memory_budget_mb is None:
             builder.build(save_dir=gt_dir, nodes_per_subgraph=self.nodes_per_subgraph)
         else:
             builder.build(save_dir=gt_dir, memory_budget_mb=self.memory_budget_mb)
@@ -342,27 +384,29 @@ class TRTVerifier:
                 self.save_dir, orig_onnx=self.onnx_path)
             load_inputs = dict(p.split(":", 1) for p in input_spec.split(",") if p)
 
+        export_output = os.path.join(self.save_dir, "full_output.json")
+
         builder = TRTBuilder(
             self.onnx_path,
             engine_path=engine_path,
             precision=self.precision,
             trtexec_path=self.trtexec_path,
             export_layer_info=layer_info_path,
-            mark_debug_tensors=True,
+            mark_debug_tensors=False,
             verbose=self.verbose,
         )
         builder.set_working_dir(self.save_dir)
         builder.build(
             load_inputs=load_inputs or None,
             iterations=1,
-            save_debug_tensors=True,
+            export_output=export_output,
         )
         print(f"[S2] full TRT engine + layer info ready: {layer_info_path}")
 
     # ── full-model output comparison ──
 
     def _full_output_match(self, gt_dir):
-        """Use debug tensors from S2 build: compare final ONNX vs TRT output.
+        """Compare final ONNX vs TRT output via --exportOutput JSON.
         Returns True if within threshold — skips subgraph split."""
         model = onnx.load(self.onnx_path)
         output_names = {o.name for o in model.graph.output}
@@ -370,14 +414,12 @@ class TRTVerifier:
         with open(os.path.join(gt_dir, "name_mapping.json")) as f:
             gt_mapping = json.load(f)
 
-        # S2 debug npy files are in save_dir (builder.set_working_dir)
-        s2_dump_dir = self.save_dir
-        dump_mapping_path = os.path.join(s2_dump_dir, "name_mapping.json")
-        if not os.path.exists(dump_mapping_path):
-            _build_trt_dump_mapping(s2_dump_dir, gt_dir=gt_dir)
+        export_json = os.path.join(self.save_dir, "full_output.json")
+        if not os.path.exists(export_json):
+            print(f"[S2.5] TRT output json not found: {export_json}")
+            return False
 
-        with open(dump_mapping_path) as f:
-            trt_mapping = json.load(f)
+        trt_outputs = _parse_trt_export_output(export_json)
 
         max_diff = 0.0
         for out_name in output_names:
@@ -385,11 +427,11 @@ class TRTVerifier:
                 continue
             onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
 
-            if out_name not in trt_mapping:
-                print(f"[S2.5] TRT output '{out_name}' not found in debug dump")
+            if out_name not in trt_outputs:
+                print(f"[S2.5] TRT output '{out_name}' not found in {export_json}")
                 return False
 
-            trt_arr = np.load(os.path.join(s2_dump_dir, trt_mapping[out_name]))
+            trt_arr = trt_outputs[out_name]
             if trt_arr.shape != onnx_arr.shape:
                 print(f"[S2.5] shape mismatch for '{out_name}': "
                       f"TRT={trt_arr.shape} ONNX={onnx_arr.shape}")

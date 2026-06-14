@@ -42,7 +42,7 @@ class TRTBuilder:
         builder_opt_level=3,
         verbose=True,
         trtexec_path=None,
-        mark_debug_tensors=True,
+        mark_debug_tensors=False,
         is_noTF32=True,
         strongly_typed=True,
         max_aux_streams=0,
