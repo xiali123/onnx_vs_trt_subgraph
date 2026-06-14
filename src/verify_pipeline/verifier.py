@@ -596,40 +596,70 @@ class TRTVerifier:
     # ── cleanup ──
 
     @staticmethod
-    def _cleanup_verify_dir(verify_dir, keep_layer_info=True, keep_dump=False):
+    def _cleanup_verify_dir(verify_dir, keep_dump=False, keep_npy=None):
         """Remove TRT artifacts from verify_dir to control disk usage.
 
-        keep_layer_info=True  → keep sub_layer_info.json (needed for deeper split)
-        keep_dump=True        → keep .npy + .engine + comparison.json (leaf failure debugging)
+        keep_dump  → keep .npy + .engine (leaf failure debugging)
+        keep_npy   → set of npy paths to preserve even when keep_dump=False
+        NOTE: comparison.json and sub_layer_info.json are NEVER deleted.
         """
         if not os.path.isdir(verify_dir):
             return
 
+        keep_npy = keep_npy or set()
+
         if not keep_dump:
-            # delete large artifacts: debug tensor dumps + engine
             for f in glob.glob(os.path.join(verify_dir, "*.npy")):
+                if f not in keep_npy:
+                    os.remove(f)
+            if not keep_npy:
+                for f in glob.glob(os.path.join(verify_dir, "*.engine")):
+                    os.remove(f)
+
+        # metadata / temp files — always cleaned regardless of keep_dump
+        for f in glob.glob(os.path.join(verify_dir, "name_mapping.json")):
+            os.remove(f)
+        for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json",
+                        "sub_output.json"]:
+            for f in glob.glob(os.path.join(verify_dir, pattern)):
                 os.remove(f)
+        inputs_dir = os.path.join(verify_dir, "inputs")
+        if os.path.isdir(inputs_dir):
+            shutil.rmtree(inputs_dir, ignore_errors=True)
+
+    @staticmethod
+    def _selective_cleanup_npy(verify_dir, comparison_rows, threshold):
+        """Keep only npy files for layers whose error exceeds *threshold*.
+
+        Returns the set of preserved npy paths (for logging / cache info).
+        """
+        # collect npy files referenced by bad layers
+        bad_npy = set()
+        for row in comparison_rows:
+            if row.get("max_abs_diff", 0) > threshold:
+                trt_file = row.get("trt_file")
+                if trt_file:
+                    bad_npy.add(os.path.join(verify_dir, trt_file))
+
+        # delete all npy files except bad ones
+        total = 0
+        kept = 0
+        for f in glob.glob(os.path.join(verify_dir, "*.npy")):
+            total += 1
+            if f in bad_npy:
+                kept += 1
+            else:
+                os.remove(f)
+
+        # delete engine if no bad layers at all
+        if not bad_npy:
             for f in glob.glob(os.path.join(verify_dir, "*.engine")):
                 os.remove(f)
-            for f in glob.glob(os.path.join(verify_dir, "name_mapping.json")):
-                os.remove(f)
-            # trtexec profile artifacts
-            for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json"]:
-                for f in glob.glob(os.path.join(verify_dir, pattern)):
-                    os.remove(f)
-            # comparison.json (regenerated at deeper levels if needed)
-            for f in glob.glob(os.path.join(verify_dir, "comparison.json")):
-                os.remove(f)
-            # input bin files (consumed by trtexec, no longer needed)
-            inputs_dir = os.path.join(verify_dir, "inputs")
-            if os.path.isdir(inputs_dir):
-                shutil.rmtree(inputs_dir, ignore_errors=True)
 
-        if not keep_layer_info:
-            for f in glob.glob(os.path.join(verify_dir, "sub_layer_info.json")):
-                os.remove(f)
-            for f in glob.glob(os.path.join(verify_dir, "sub_output.json")):
-                os.remove(f)
+        if total:
+            logger.debug("selective npy cleanup: kept %d/%d (max_abs_diff > %.1e)",
+                         kept, total, threshold)
+        return bad_npy
 
     # ── dataflow ordering ──
 
@@ -787,17 +817,16 @@ class TRTVerifier:
                            if k not in ("top_errors",)}
             if passed:
                 report.passed.append(entry)
-                self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
+                self._cleanup_verify_dir(verify_dir)
                 status = "passed"
             elif node_count >= self.min_nodes:
                 logger.info("[verify:%d.%d] queued for deeper verification", depth, i)
                 retry_list.append((sub_onnx, i))
-                self._cleanup_verify_dir(verify_dir, keep_layer_info=True)
+                self._cleanup_verify_dir(verify_dir)
                 status = "queued"
             else:
                 report.failed.append(entry)
-                self._cleanup_verify_dir(verify_dir, keep_layer_info=True,
-                                         keep_dump=True)
+                self._cleanup_verify_dir(verify_dir, keep_dump=True)
                 status = "failed"
 
             self._cache.setdefault("subgraphs", {})[cache_key] = {
@@ -815,7 +844,7 @@ class TRTVerifier:
             if os.path.exists(sub_layer_info):
                 self._verify(sub_onnx, sub_layer_info, gt_dir, depth + 1, report)
                 # deeper verification done — parent's artifacts no longer needed
-                self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
+                self._cleanup_verify_dir(verify_dir)
             else:
                 logger.warning("[verify:%d] skip — no layer info for %s",
                                depth, os.path.basename(sub_onnx))
@@ -893,6 +922,10 @@ class TRTVerifier:
                 (r.get("max_abs_diff", 0) for r in result.rows), default=0
             )
             summary = result.summary
+
+            # leaf nodes: keep only npy files for layers above threshold
+            if is_leaf:
+                self._selective_cleanup_npy(verify_dir, result.rows, self.threshold)
         except Exception as e:
             logger.error("[verify:%d.%d] comparison failed: %s", depth, idx, e)
             report.errors.append({
