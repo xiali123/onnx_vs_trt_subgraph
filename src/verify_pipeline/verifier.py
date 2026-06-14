@@ -149,6 +149,7 @@ class TRTVerifier:
         threshold=1e-3,
         min_nodes=500,
         nodes_per_subgraph=1000,
+        memory_budget_mb=512,
         precision="fp16",
         verbose=True,
     ):
@@ -158,6 +159,7 @@ class TRTVerifier:
         self.threshold = threshold
         self.min_nodes = min_nodes
         self.nodes_per_subgraph = nodes_per_subgraph
+        self.memory_budget_mb = memory_budget_mb
         self.precision = precision
         self.verbose = verbose
 
@@ -243,7 +245,10 @@ class TRTVerifier:
 
         model = GraphModel(self.onnx_path)
         builder = DumpBuilder(model, AllTensorSelector())
-        builder.build(save_dir=gt_dir, nodes_per_subgraph=self.nodes_per_subgraph)
+        if self.nodes_per_subgraph is not None:
+            builder.build(save_dir=gt_dir, nodes_per_subgraph=self.nodes_per_subgraph)
+        else:
+            builder.build(save_dir=gt_dir, memory_budget_mb=self.memory_budget_mb)
 
         carry = {}
         for inp in model.inputs:

@@ -38,17 +38,25 @@ class ORTRunner:
 
         return dict(zip(output_names, outputs))
 
-    def dump(self, inputs, save_dir):
+    def dump(self, inputs, save_dir, min_bytes=0):
         os.makedirs(save_dir, exist_ok=True)
 
         outputs = self.run(inputs)
 
         new_mapping = {}
-        for name in outputs:
+        tensor_sizes = {}
+        for name, value in outputs.items():
+            if value.nbytes < min_bytes:
+                continue
             safe = _safe_name(name)
             new_mapping[name] = f"{safe}.npy"
+            tensor_sizes[name] = {
+                "bytes": int(value.nbytes),
+                "dtype": str(value.dtype),
+                "shape": list(value.shape),
+            }
 
-        # merge into existing mapping file
+        # merge name_mapping
         map_path = os.path.join(save_dir, "name_mapping.json")
         if os.path.exists(map_path):
             with open(map_path, "r") as f:
@@ -59,11 +67,23 @@ class ORTRunner:
         with open(map_path, "w") as f:
             json.dump(mapping, f, indent=2, ensure_ascii=False)
 
+        # merge tensor_sizes
+        sizes_path = os.path.join(save_dir, "tensor_sizes.json")
+        if os.path.exists(sizes_path):
+            with open(sizes_path, "r") as f:
+                sizes = json.load(f)
+        else:
+            sizes = {}
+        sizes.update(tensor_sizes)
+        with open(sizes_path, "w") as f:
+            json.dump(sizes, f, indent=2, ensure_ascii=False)
+
         # save tensors
         for name, value in outputs.items():
-            np.save(
-                os.path.join(save_dir, new_mapping[name]),
-                value
-            )
+            if name in new_mapping:
+                np.save(
+                    os.path.join(save_dir, new_mapping[name]),
+                    value
+                )
 
         return outputs

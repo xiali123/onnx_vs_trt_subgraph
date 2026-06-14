@@ -9,9 +9,10 @@ model = GraphModel(model_path)
 
 dump_dir = os.path.join(os.path.dirname(__file__), "dump_models_v1")
 
-# Step 1: 按节点数分割成多个独立子图
+# Step 1: 按内存预算分割成多个独立子图 (默认512MB)
 builder = DumpBuilder(model, AllTensorSelector())
-builder.build(save_dir=dump_dir, nodes_per_subgraph=100)
+builder.build(save_dir=dump_dir, memory_budget_mb=512)
+# 如需按节点数分割：builder.build(save_dir=dump_dir, nodes_per_subgraph=100)
 
 # Step 2: 级联推理 — 前一个子图的输出作为后一个子图的输入
 carry = {"input": np.random.randn(1, 16, 28, 28).astype(np.float32)}

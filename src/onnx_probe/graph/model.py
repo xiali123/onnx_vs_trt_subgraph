@@ -64,6 +64,20 @@ class GraphModel:
 
         return new_model
 
+    @property
+    def type_map(self):
+        """{tensor_name: ValueInfoProto} for all known value-info entries."""
+        g = self.onnx_model.graph
+        tm = {}
+        for vi in list(g.input) + list(g.output) + list(g.value_info):
+            tm[vi.name] = vi
+        return tm
+
+    @property
+    def init_map(self):
+        """{initializer_name: TensorProto} for all initializers."""
+        return {init.name: init for init in self.onnx_model.graph.initializer}
+
     def save(self, save_path):
 
         self.graph.cleanup()
