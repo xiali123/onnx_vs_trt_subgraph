@@ -177,7 +177,7 @@ class TRTBuilder:
             specs = ",".join(f"{k}:{v}" for k, v in load_inputs.items())
             args.append("--loadInputs=" + specs)
         if save_debug_tensors:
-            args.append("--saveAllDebugTensors")
+            args.append("--saveAllDebugTensors=numpy")
         if export_output:
             args.append("--exportOutput=" + export_output)
 
@@ -200,7 +200,7 @@ class TRTBuilder:
             args.append("--loadInputs=" + specs)
         args.append("--iterations=" + str(iterations))
         if save_debug_tensors:
-            args.append("--saveAllDebugTensors")
+            args.append("--saveAllDebugTensors=numpy")
         if export_output:
             args.append("--exportOutput=" + export_output)
 
