@@ -23,50 +23,10 @@ _ONNX_DTYPE_MAP = {
     TensorProto.BOOL: bool,
 }
 
-# TRT layer info "Format/Datatype" → numpy dtype
-_TRT_DTYPE_RE = re.compile(r"\b(FP32|FP16|INT32|INT64|INT8|BOOL|BF16|FLOAT32|FLOAT16)\b",
-                           re.IGNORECASE)
-_TRT_DTYPE_MAP = {
-    "FP32": np.float32, "FLOAT32": np.float32,
-    "FP16": np.float16, "FLOAT16": np.float16,
-    "INT32": np.int32, "INT64": np.int64,
-    "INT8": np.int8, "BOOL": np.bool_,
-    "BF16": np.float16,
+# dtypes TRT does not support as network I/O → safe fallback
+_TRT_COMPAT_DTYPE = {
+    np.float64: np.float32,
 }
-
-
-def _parse_trt_binding_types(layer_info_path):
-    """Extract {tensor_name: numpy_dtype} from TRT layer-info JSON.
-
-    Reads every layer's Inputs/Outputs Format/Datatype field and builds a
-    lookup so downstream logic knows what dtype TRT expects for each tensor.
-    """
-    with open(layer_info_path, encoding="utf-8") as f:
-        data = json.load(f)
-    type_map = {}
-    for layer in data.get("Layers", []):
-        for entry in layer.get("Inputs", []) + layer.get("Outputs", []):
-            name = entry.get("Name", "")
-            fmt = entry.get("Format/Datatype", "")
-            m = _TRT_DTYPE_RE.search(fmt)
-            if m and name:
-                type_map[name] = _TRT_DTYPE_MAP.get(m.group(1).upper(), np.float32)
-    return type_map
-
-
-def _resolve_trt_input_dtype(tensor_name, onnx_dtype, precision, binding_types):
-    """Return the numpy dtype TRT expects for *tensor_name*.
-
-    Priority: exact match in *binding_types* (from parent layer-info) →
-    precision-based cast (fp16 → float16 only for floating inputs) →
-    keep original ONNX dtype.
-    """
-    if binding_types and tensor_name in binding_types:
-        return binding_types[tensor_name]
-    if precision == "fp16" and np.issubdtype(onnx_dtype, np.floating):
-        return np.float16
-    return onnx_dtype
-
 
 def _parse_onnx_inputs(onnx_path):
     """Return {input_name: (shape, numpy_dtype)} for runtime graph inputs
@@ -97,16 +57,16 @@ def _find_constant_value(model_path, tensor_name):
 
 
 def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir,
-                      orig_onnx=None, precision="fp32", parent_layer_info=None):
+                      orig_onnx=None):
     """Prepare subgraph inputs from ground truth, return trtexec --loadInputs string.
 
     If orig_onnx is given, use it to resolve Constant node outputs that appear as
     subgraph inputs.
     Paths in the spec are relative to trt_working_dir (to avoid Windows C: colon issue).
 
-    *precision* and *parent_layer_info* determine the target dtype for each
-    input bin: ground-truth data (FP32 from ORT) is cast to match the dtype
-    TRT expects, e.g. FP16 when running in fp16 mode.
+    Ground-truth data is cast to match the ONNX model's input dtype before writing
+    the bin file — that is the type trtexec --loadInputs expects (network binding
+    type, not TRT internal precision).
     """
     os.makedirs(inputs_dir, exist_ok=True)
 
@@ -114,10 +74,6 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir,
 
     with open(os.path.join(gt_dir, "name_mapping.json")) as f:
         gt_mapping = json.load(f)
-
-    binding_types = None
-    if parent_layer_info and os.path.exists(parent_layer_info):
-        binding_types = _parse_trt_binding_types(parent_layer_info)
 
     spec_parts = []
     for name, (shape, onnx_dtype) in input_specs.items():
@@ -133,10 +89,12 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir,
         else:
             arr = np.random.randn(*shape).astype(onnx_dtype)
 
-        # cast ground-truth data to TRT's expected input dtype
-        trt_dtype = _resolve_trt_input_dtype(name, onnx_dtype, precision, binding_types)
-        if arr.dtype != trt_dtype:
-            arr = arr.astype(trt_dtype)
+        # trtexec --loadInputs expects data matching the network binding type,
+        # which is the ONNX input dtype (not TRT internal precision).
+        # TRT does not support all dtypes (e.g. float64) — downgrade when needed.
+        target_dtype = _TRT_COMPAT_DTYPE.get(onnx_dtype, onnx_dtype)
+        if arr.dtype != target_dtype:
+            arr = arr.astype(target_dtype)
 
         safe = name.replace("/", "_").replace(":", "_")
         bin_file = f"{safe}.bin"
@@ -485,8 +443,7 @@ class TRTVerifier:
             input_spec = _build_input_spec(
                 self.onnx_path, gt_dir,
                 os.path.join(self.save_dir, "s2_inputs"),
-                self.save_dir, orig_onnx=self.onnx_path,
-                precision=self.precision)
+                self.save_dir, orig_onnx=self.onnx_path)
             load_inputs = dict(p.split(":", 1) for p in input_spec.split(",") if p)
 
         export_output = os.path.join(self.save_dir, "full_output.json")
@@ -592,8 +549,7 @@ class TRTVerifier:
             node_count = len(sub_model.graph.node)
             print(f"[verify:{depth}.{i}] {os.path.basename(sub_onnx)}: {node_count} nodes")
 
-            passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report,
-                                              parent_layer_info=layer_info_path)
+            passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report)
 
             verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
                                       f"verify_sub_{i}")
@@ -629,7 +585,7 @@ class TRTVerifier:
 
     # ── verify single subgraph ──
 
-    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report, parent_layer_info=None):
+    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report):
         """Verify one subgraph. Returns (passed: bool, entry: dict)."""
         sub_model = onnx.load(sub_onnx)
         node_count = len(sub_model.graph.node)
@@ -647,9 +603,7 @@ class TRTVerifier:
         # 非叶子节点 → 只 export 最终输出，判断是否需要继续递归
         is_leaf = node_count < self.min_nodes
         input_spec = _build_input_spec(sub_onnx, gt_dir, inputs_dir, verify_dir,
-                                       orig_onnx=self.onnx_path,
-                                       precision=self.precision,
-                                       parent_layer_info=parent_layer_info)
+                                       orig_onnx=self.onnx_path)
         load_inputs = dict(
             pair.split(":", 1) for pair in input_spec.split(",") if pair
         )
