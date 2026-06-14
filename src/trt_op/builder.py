@@ -70,6 +70,7 @@ class TRTBuilder:
         self.dump_profile = dump_profile
         self.static_plugins = static_plugins
         self.separate_profile_run = separate_profile_run
+        self.working_dir = None
 
         self._profiles = []
         self._calib_dir = None
@@ -87,6 +88,10 @@ class TRTBuilder:
 
     def set_timing_cache(self, path):
         self._timing_cache = path
+        return self
+
+    def set_working_dir(self, path):
+        self.working_dir = path
         return self
 
     # ── build ──
@@ -178,7 +183,7 @@ class TRTBuilder:
 
         if self.verbose:
             print("[trtexec]", " ".join(args))
-        r = subprocess.run(args, capture_output=True, text=True)
+        r = subprocess.run(args, capture_output=True, text=True, cwd=self.working_dir)
         if r.returncode != 0:
             raise RuntimeError(f"trtexec build failed:\n{r.stderr}")
         return _parse_latency(r.stdout)
@@ -201,7 +206,7 @@ class TRTBuilder:
 
         if self.verbose:
             print("[trtexec]", " ".join(args))
-        r = subprocess.run(args, capture_output=True, text=True)
+        r = subprocess.run(args, capture_output=True, text=True, cwd=self.working_dir)
         if r.returncode != 0:
             raise RuntimeError(f"trtexec run failed:\n{r.stderr}")
         return _parse_latency(r.stdout)

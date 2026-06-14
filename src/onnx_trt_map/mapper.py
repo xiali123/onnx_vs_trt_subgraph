@@ -32,9 +32,12 @@ class LayerMapper:
 
         # tensor_name -> (node_index, node_proto)
         self._tensor_to_node = {}
+        # node_name -> (node_index, node_proto)
+        self._node_name_to_node = {}
         # tensor_name -> set of consumer node indices
         self._tensor_to_consumers = {}
         for i, n in enumerate(self._nodes):
+            self._node_name_to_node[n.name] = (i, n)
             for out in n.output:
                 self._tensor_to_node[out] = (i, n)
             for inp in n.input:
@@ -63,6 +66,8 @@ class LayerMapper:
             for mname in meta_names:
                 tname = mname.replace("node_of_", "", 1) if mname.startswith("node_of_") else mname
                 node = self._tensor_to_node.get(tname)
+                if node is None:
+                    node = self._node_name_to_node.get(tname)
                 if node:
                     matched.append(node)
 
