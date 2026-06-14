@@ -150,6 +150,21 @@ class LayerMapper:
     def mapping(self):
         return dict(self._trt_to_onnx)
 
+    @property
+    def layers(self):
+        """All TRT layers from the JSON dump."""
+        return self._layers
+
+    @property
+    def trt_outputs(self):
+        """{trt_layer_name: downstream_onnx_tensor_name} mapping."""
+        return dict(self._trt_output)
+
+    @property
+    def trt_to_onnx_map(self):
+        """{trt_layer_name: [onnx_node_proto]} mapping (full dict)."""
+        return dict(self._trt_to_onnx)
+
     # ── stats ──
 
     def stats(self):
@@ -177,7 +192,7 @@ class LayerMapper:
                 "trt_name": name,
                 "trt_type": layer["LayerType"],
                 "onnx_count": len(onnx_nodes),
-                "onnx_nodes": ", ".join(n.output[0] for n in onnx_nodes),
+                "onnx_nodes": ", ".join(o for n in onnx_nodes for o in n.output),
                 "onnx_ops": ", ".join(n.op_type for n in onnx_nodes),
                 "trt_output": self._trt_output.get(name, ""),
             })

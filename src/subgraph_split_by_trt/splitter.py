@@ -17,9 +17,9 @@ class TRTPartitioner:
 
         # ordered TRT layers that have ONNX mappings (skip NoOp/Reformat)
         self._ordered_layers = []
-        for layer in self._mapper._layers:
+        for layer in self._mapper.layers:
             name = layer["Name"]
-            if name in self._mapper._trt_to_onnx:
+            if name in self._mapper.trt_to_onnx_map:
                 self._ordered_layers.append(layer)
 
         # type info cache
@@ -36,7 +36,7 @@ class TRTPartitioner:
         return self._build_subgraphs(groups, save_dir)
 
     def split_by_count(self, save_dir, num_subgraphs=10):
-        total = sum(len(self._mapper._trt_to_onnx[l["Name"]]) for l in self._ordered_layers)
+        total = sum(len(self._mapper.trt_to_onnx_map[l["Name"]]) for l in self._ordered_layers)
         target = total // num_subgraphs
         return self.split(save_dir, nodes_per_subgraph=target)
 
@@ -49,7 +49,7 @@ class TRTPartitioner:
         current_weight = 0
 
         for layer in self._ordered_layers:
-            weight = len(self._mapper._trt_to_onnx[layer["Name"]])
+            weight = len(self._mapper.trt_to_onnx_map[layer["Name"]])
 
             if current_weight >= target and current_group:
                 groups.append(current_group)
@@ -76,8 +76,8 @@ class TRTPartitioner:
             # collect all ONNX nodes for this group
             onnx_node_names = set()
             for layer in group:
-                for n in self._mapper._trt_to_onnx[layer["Name"]]:
-                    onnx_node_names.add(n.output[0])
+                for n in self._mapper.trt_to_onnx_map[layer["Name"]]:
+                    onnx_node_names.update(n.output)
 
             # collect ONNX proto nodes + their inputs/outputs
             chunk_nodes = []
@@ -101,8 +101,13 @@ class TRTPartitioner:
                         consumed.add(inp)
 
             # sort by original graph order (preserves topological sort)
-            node_order = {n.name: i for i, n in enumerate(self._graph.node)}
-            chunk_nodes.sort(key=lambda n: node_order.get(n.name, 0))
+            node_order = {}
+            for i, n in enumerate(self._graph.node):
+                # use output[0] as fallback for unnamed nodes (ONNX allows empty names)
+                key = n.name or (n.output[0] if n.output else "")
+                node_order[key] = i
+            chunk_nodes.sort(key=lambda n: node_order.get(
+                n.name or (n.output[0] if n.output else ""), 0))
 
             external_inputs = consumed - produced
 
@@ -145,15 +150,15 @@ class TRTPartitioner:
             # rows for CSV
             for layer in group:
                 name = layer["Name"]
-                onnx_nodes = self._mapper._trt_to_onnx.get(name, [])
+                onnx_nodes = self._mapper.trt_to_onnx(name)
                 rows.append({
                     "trt_name": name,
                     "trt_type": layer["LayerType"],
                     "subgraph": gid,
                     "subgraph_file": fname,
                     "onnx_count": len(onnx_nodes),
-                    "onnx_nodes": ", ".join(n.output[0] for n in onnx_nodes),
-                    "trt_output": self._mapper._trt_output.get(name, ""),
+                    "onnx_nodes": ", ".join(o for n in onnx_nodes for o in n.output),
+                    "trt_output": self._mapper.trt_outputs.get(name, ""),
                 })
 
             print(f"[{gid}] {fname}: {len(chunk_nodes)} onnx nodes, {len(group)} TRT layers")

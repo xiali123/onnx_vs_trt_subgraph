@@ -104,10 +104,10 @@ class LayerComparator:
         missing_onnx = 0
         skipped = 0
 
-        for layer in self._mapper._layers:
+        for layer in self._mapper.layers:
             name = layer["Name"]
-            onnx_output_name = self._mapper._trt_output.get(name, "")
-            onnx_nodes = self._mapper._trt_to_onnx.get(name, [])
+            onnx_output_name = self._mapper.trt_outputs.get(name, "")
+            onnx_nodes = self._mapper.trt_to_onnx_map.get(name, [])
 
             # collect ALL outputs from matched ONNX nodes (for fallback lookup)
             all_onnx_outputs = []
@@ -118,7 +118,7 @@ class LayerComparator:
                 "trt_layer": name,
                 "trt_type": layer["LayerType"],
                 "trt_output": onnx_output_name,
-                "onnx_nodes": ", ".join(n.output[0] for n in onnx_nodes),
+                "onnx_nodes": ", ".join(o for n in onnx_nodes for o in n.output),
                 "onnx_ops": ", ".join(n.op_type for n in onnx_nodes),
             }
 
@@ -191,7 +191,7 @@ class LayerComparator:
         self._result = CompareResult(
             rows=rows,
             summary={
-                "total_layers": len(self._mapper._layers),
+                "total_layers": len(self._mapper.layers),
                 "compared": matched,
                 "skipped_unmapped": skipped,
                 "shape_mismatch": shape_mismatch,

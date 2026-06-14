@@ -23,6 +23,50 @@ _ONNX_DTYPE_MAP = {
     TensorProto.BOOL: bool,
 }
 
+# TRT layer info "Format/Datatype" → numpy dtype
+_TRT_DTYPE_RE = re.compile(r"\b(FP32|FP16|INT32|INT64|INT8|BOOL|BF16|FLOAT32|FLOAT16)\b",
+                           re.IGNORECASE)
+_TRT_DTYPE_MAP = {
+    "FP32": np.float32, "FLOAT32": np.float32,
+    "FP16": np.float16, "FLOAT16": np.float16,
+    "INT32": np.int32, "INT64": np.int64,
+    "INT8": np.int8, "BOOL": np.bool_,
+    "BF16": np.float16,
+}
+
+
+def _parse_trt_binding_types(layer_info_path):
+    """Extract {tensor_name: numpy_dtype} from TRT layer-info JSON.
+
+    Reads every layer's Inputs/Outputs Format/Datatype field and builds a
+    lookup so downstream logic knows what dtype TRT expects for each tensor.
+    """
+    with open(layer_info_path, encoding="utf-8") as f:
+        data = json.load(f)
+    type_map = {}
+    for layer in data.get("Layers", []):
+        for entry in layer.get("Inputs", []) + layer.get("Outputs", []):
+            name = entry.get("Name", "")
+            fmt = entry.get("Format/Datatype", "")
+            m = _TRT_DTYPE_RE.search(fmt)
+            if m and name:
+                type_map[name] = _TRT_DTYPE_MAP.get(m.group(1).upper(), np.float32)
+    return type_map
+
+
+def _resolve_trt_input_dtype(tensor_name, onnx_dtype, precision, binding_types):
+    """Return the numpy dtype TRT expects for *tensor_name*.
+
+    Priority: exact match in *binding_types* (from parent layer-info) →
+    precision-based cast (fp16 → float16 only for floating inputs) →
+    keep original ONNX dtype.
+    """
+    if binding_types and tensor_name in binding_types:
+        return binding_types[tensor_name]
+    if precision == "fp16" and np.issubdtype(onnx_dtype, np.floating):
+        return np.float16
+    return onnx_dtype
+
 
 def _parse_onnx_inputs(onnx_path):
     """Return {input_name: (shape, numpy_dtype)} for runtime graph inputs
@@ -52,11 +96,18 @@ def _find_constant_value(model_path, tensor_name):
     return None
 
 
-def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir, orig_onnx=None):
+def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir,
+                      orig_onnx=None, precision="fp32", parent_layer_info=None):
     """Prepare subgraph inputs from ground truth, return trtexec --loadInputs string.
+
     If orig_onnx is given, use it to resolve Constant node outputs that appear as
     subgraph inputs.
-    Paths in the spec are relative to trt_working_dir (to avoid Windows C: colon issue)."""
+    Paths in the spec are relative to trt_working_dir (to avoid Windows C: colon issue).
+
+    *precision* and *parent_layer_info* determine the target dtype for each
+    input bin: ground-truth data (FP32 from ORT) is cast to match the dtype
+    TRT expects, e.g. FP16 when running in fp16 mode.
+    """
     os.makedirs(inputs_dir, exist_ok=True)
 
     input_specs = _parse_onnx_inputs(subgraph_onnx)
@@ -64,8 +115,12 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir, orig_o
     with open(os.path.join(gt_dir, "name_mapping.json")) as f:
         gt_mapping = json.load(f)
 
+    binding_types = None
+    if parent_layer_info and os.path.exists(parent_layer_info):
+        binding_types = _parse_trt_binding_types(parent_layer_info)
+
     spec_parts = []
-    for name, (shape, dtype) in input_specs.items():
+    for name, (shape, onnx_dtype) in input_specs.items():
         if name in gt_mapping:
             npy_file = gt_mapping[name]
             arr = np.load(os.path.join(gt_dir, npy_file))
@@ -74,9 +129,14 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir, orig_o
             if const_val is not None:
                 arr = const_val
             else:
-                arr = (np.random.randn(*shape) * 0.02).astype(dtype)
+                arr = (np.random.randn(*shape) * 0.02).astype(onnx_dtype)
         else:
-            arr = np.random.randn(*shape).astype(dtype)
+            arr = np.random.randn(*shape).astype(onnx_dtype)
+
+        # cast ground-truth data to TRT's expected input dtype
+        trt_dtype = _resolve_trt_input_dtype(name, onnx_dtype, precision, binding_types)
+        if arr.dtype != trt_dtype:
+            arr = arr.astype(trt_dtype)
 
         safe = name.replace("/", "_").replace(":", "_")
         bin_file = f"{safe}.bin"
@@ -110,9 +170,13 @@ def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
 
     mapping = {}
     for f in npy_files:
-        stem = os.path.splitext(f)[0]
-        # strip "{iter:04d}_{tensor}" prefix — iteration can be 4+ digits
-        stem = re.sub(r"^\d{4,}_", "", stem)
+        full_stem = os.path.splitext(f)[0]
+        # strip "{iter}_{tensor}" prefix only if result is a known ONNX tensor
+        m = re.match(r"^(\d{4,})_(.+)", full_stem)
+        if m and m.group(2) in safe_to_onnx:
+            stem = m.group(2)
+        else:
+            stem = full_stem
 
         # resolve via ground-truth reverse lookup first
         onnx_name = safe_to_onnx.get(stem)
@@ -172,8 +236,13 @@ def _parse_trt_export_output(json_path):
     return result
 
 
-def _compare_outputs(sub_onnx, gt_dir, trt_outputs):
-    """Compare subgraph TRT outputs against ground truth. Returns max_abs_diff."""
+def _compare_outputs(sub_onnx, gt_dir, trt_outputs, strict=False):
+    """Compare subgraph TRT outputs against ground truth.
+
+    Returns (max_abs_diff, errors) where errors is a list of description strings.
+    In strict mode missing outputs and shape mismatches are counted as errors;
+    in lenient mode they are silently skipped (useful for partial subgraphs).
+    """
     sub_model = onnx.load(sub_onnx)
     output_names = {o.name for o in sub_model.graph.output}
 
@@ -181,23 +250,31 @@ def _compare_outputs(sub_onnx, gt_dir, trt_outputs):
         gt_mapping = json.load(f)
 
     max_diff = 0.0
+    errors = []
     for out_name in output_names:
         if out_name not in gt_mapping:
+            if strict:
+                errors.append(f"ground truth missing for '{out_name}'")
             continue
         onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
 
         if out_name not in trt_outputs:
+            if strict:
+                errors.append(f"TRT output '{out_name}' not found")
             continue
 
         trt_arr = trt_outputs[out_name]
         if trt_arr.shape != onnx_arr.shape:
+            if strict:
+                errors.append(f"shape mismatch for '{out_name}': "
+                              f"TRT={trt_arr.shape} ONNX={onnx_arr.shape}")
             continue
 
         diff = float(np.abs(onnx_arr.astype(np.float64) -
                             trt_arr.astype(np.float64)).max())
         max_diff = max(max_diff, diff)
 
-    return max_diff
+    return max_diff, errors
 
 
 @dataclass
@@ -408,7 +485,8 @@ class TRTVerifier:
             input_spec = _build_input_spec(
                 self.onnx_path, gt_dir,
                 os.path.join(self.save_dir, "s2_inputs"),
-                self.save_dir, orig_onnx=self.onnx_path)
+                self.save_dir, orig_onnx=self.onnx_path,
+                precision=self.precision)
             load_inputs = dict(p.split(":", 1) for p in input_spec.split(",") if p)
 
         export_output = os.path.join(self.save_dir, "full_output.json")
@@ -435,38 +513,18 @@ class TRTVerifier:
     def _full_output_match(self, gt_dir):
         """Compare final ONNX vs TRT output via --exportOutput JSON.
         Returns True if within threshold — skips subgraph split."""
-        model = onnx.load(self.onnx_path)
-        output_names = {o.name for o in model.graph.output}
-
-        with open(os.path.join(gt_dir, "name_mapping.json")) as f:
-            gt_mapping = json.load(f)
-
         export_json = os.path.join(self.save_dir, "full_output.json")
         if not os.path.exists(export_json):
             print(f"[S2.5] TRT output json not found: {export_json}")
             return False
 
         trt_outputs = _parse_trt_export_output(export_json)
+        max_diff, errors = _compare_outputs(self.onnx_path, gt_dir, trt_outputs, strict=True)
 
-        max_diff = 0.0
-        for out_name in output_names:
-            if out_name not in gt_mapping:
-                continue
-            onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
-
-            if out_name not in trt_outputs:
-                print(f"[S2.5] TRT output '{out_name}' not found in {export_json}")
-                return False
-
-            trt_arr = trt_outputs[out_name]
-            if trt_arr.shape != onnx_arr.shape:
-                print(f"[S2.5] shape mismatch for '{out_name}': "
-                      f"TRT={trt_arr.shape} ONNX={onnx_arr.shape}")
-                return False
-
-            diff = float(np.abs(onnx_arr.astype(np.float64) -
-                                trt_arr.astype(np.float64)).max())
-            max_diff = max(max_diff, diff)
+        for err in errors:
+            print(f"[S2.5] {err}")
+        if errors:
+            return False
 
         if max_diff <= self.threshold:
             print(f"[S2.5] full output matched (max_diff={max_diff:.6f}) — "
@@ -534,7 +592,8 @@ class TRTVerifier:
             node_count = len(sub_model.graph.node)
             print(f"[verify:{depth}.{i}] {os.path.basename(sub_onnx)}: {node_count} nodes")
 
-            passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report)
+            passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report,
+                                              parent_layer_info=layer_info_path)
 
             verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
                                       f"verify_sub_{i}")
@@ -544,7 +603,7 @@ class TRTVerifier:
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
             elif node_count >= self.min_nodes:
                 print(f"[verify:{depth}.{i}] queued for deeper verification")
-                retry_list.append(sub_onnx)
+                retry_list.append((sub_onnx, i))
                 # 非叶子：删除 npy/engine，保留 sub_layer_info 给更深层用
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=True)
             else:
@@ -554,8 +613,7 @@ class TRTVerifier:
                                          keep_dump=True)
 
         # C. BFS: recurse into all queued subgraphs
-        for sub_onnx in retry_list:
-            idx = sub_onnx_files.index(sub_onnx)
+        for sub_onnx, idx in retry_list:
             verify_dir = os.path.join(
                 self.save_dir, f"depth_{depth}",
                 f"verify_sub_{idx}"
@@ -571,7 +629,7 @@ class TRTVerifier:
 
     # ── verify single subgraph ──
 
-    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report):
+    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report, parent_layer_info=None):
         """Verify one subgraph. Returns (passed: bool, entry: dict)."""
         sub_model = onnx.load(sub_onnx)
         node_count = len(sub_model.graph.node)
@@ -589,7 +647,9 @@ class TRTVerifier:
         # 非叶子节点 → 只 export 最终输出，判断是否需要继续递归
         is_leaf = node_count < self.min_nodes
         input_spec = _build_input_spec(sub_onnx, gt_dir, inputs_dir, verify_dir,
-                                       orig_onnx=self.onnx_path)
+                                       orig_onnx=self.onnx_path,
+                                       precision=self.precision,
+                                       parent_layer_info=parent_layer_info)
         load_inputs = dict(
             pair.split(":", 1) for pair in input_spec.split(",") if pair
         )
@@ -603,6 +663,8 @@ class TRTVerifier:
             verbose=self.verbose,
         )
         builder.set_working_dir(verify_dir)
+
+        comparator = None  # only set in leaf path; safe against NameError
 
         if is_leaf:
             try:
@@ -645,7 +707,7 @@ class TRTVerifier:
                 return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
             trt_outputs = _parse_trt_export_output(export_output)
-            max_diff = _compare_outputs(sub_onnx, gt_dir, trt_outputs)
+            max_diff, _ = _compare_outputs(sub_onnx, gt_dir, trt_outputs)
             summary = {"max_abs_diff": max_diff}
 
         entry = {
