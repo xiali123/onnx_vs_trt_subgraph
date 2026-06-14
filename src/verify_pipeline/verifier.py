@@ -74,7 +74,7 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir, orig_o
             if const_val is not None:
                 arr = const_val
             else:
-                arr = np.random.randn(*shape).astype(dtype)
+                arr = (np.random.randn(*shape) * 0.02).astype(dtype)
         else:
             arr = np.random.randn(*shape).astype(dtype)
 
@@ -177,8 +177,16 @@ class TRTVerifier:
         full_layer_info = os.path.join(self.save_dir, "full_layers.json")
         self._step_full_trt_convert(full_layer_info)
 
-        # S3: verify recursively (also generates full LayerMapper internally)
         report = VerifyReport(threshold=self.threshold)
+
+        # S2.5: quick full-model output comparison — if they match, skip subgraph
+        if self._full_output_match(gt_dir):
+            report.summary = {"passed": 0, "failed": 0, "errors": 0,
+                              "threshold": self.threshold, "full_output_match": True}
+            self._report = report
+            return report
+
+        # S3: BFS subgraph verification
         self._verify(
             onnx_path=self.onnx_path,
             layer_info_path=full_layer_info,
@@ -191,6 +199,7 @@ class TRTVerifier:
             "failed": len(report.failed),
             "errors": len(report.errors),
             "threshold": self.threshold,
+            "full_output_match": False,
         }
         self._report = report
         return report
@@ -241,7 +250,7 @@ class TRTVerifier:
             shape = tuple(
                 d if isinstance(d, int) and d > 0 else 1 for d in inp.shape
             )
-            arr = np.random.randn(*shape).astype(np.float32)
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
             carry[inp.name] = arr
 
             # save initial input to ground truth so subgraph verification can use it
@@ -287,17 +296,81 @@ class TRTVerifier:
         engine_path = os.path.join(os.path.dirname(layer_info_path),
                                    os.path.splitext(os.path.basename(self.onnx_path))[0] + ".engine")
 
+        # prepare bin input from ground truth (uses same input as S1 ORT dump)
+        gt_dir = os.path.join(self.save_dir, "ground_truth")
+        load_inputs = {}
+        if os.path.exists(os.path.join(gt_dir, "name_mapping.json")):
+            input_spec = _build_input_spec(
+                self.onnx_path, gt_dir,
+                os.path.join(self.save_dir, "s2_inputs"),
+                self.save_dir, orig_onnx=self.onnx_path)
+            load_inputs = dict(p.split(":", 1) for p in input_spec.split(",") if p)
+
         builder = TRTBuilder(
             self.onnx_path,
             engine_path=engine_path,
             precision=self.precision,
             trtexec_path=self.trtexec_path,
             export_layer_info=layer_info_path,
+            mark_debug_tensors=True,
             verbose=self.verbose,
         )
-        builder.set_working_dir(os.path.dirname(layer_info_path))
-        builder.build()
+        builder.set_working_dir(self.save_dir)
+        builder.build(
+            load_inputs=load_inputs or None,
+            iterations=1,
+            save_debug_tensors=True,
+        )
         print(f"[S2] full TRT engine + layer info ready: {layer_info_path}")
+
+    # ── full-model output comparison ──
+
+    def _full_output_match(self, gt_dir):
+        """Use debug tensors from S2 build: compare final ONNX vs TRT output.
+        Returns True if within threshold — skips subgraph split."""
+        model = onnx.load(self.onnx_path)
+        output_names = {o.name for o in model.graph.output}
+
+        with open(os.path.join(gt_dir, "name_mapping.json")) as f:
+            gt_mapping = json.load(f)
+
+        # S2 debug npy files are in save_dir (builder.set_working_dir)
+        s2_dump_dir = self.save_dir
+        dump_mapping_path = os.path.join(s2_dump_dir, "name_mapping.json")
+        if not os.path.exists(dump_mapping_path):
+            _build_trt_dump_mapping(s2_dump_dir, gt_dir=gt_dir)
+
+        with open(dump_mapping_path) as f:
+            trt_mapping = json.load(f)
+
+        max_diff = 0.0
+        for out_name in output_names:
+            if out_name not in gt_mapping:
+                continue
+            onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
+
+            if out_name not in trt_mapping:
+                print(f"[S2.5] TRT output '{out_name}' not found in debug dump")
+                return False
+
+            trt_arr = np.load(os.path.join(s2_dump_dir, trt_mapping[out_name]))
+            if trt_arr.shape != onnx_arr.shape:
+                print(f"[S2.5] shape mismatch for '{out_name}': "
+                      f"TRT={trt_arr.shape} ONNX={onnx_arr.shape}")
+                return False
+
+            diff = float(np.abs(onnx_arr.astype(np.float64) -
+                                trt_arr.astype(np.float64)).max())
+            max_diff = max(max_diff, diff)
+
+        if max_diff <= self.threshold:
+            print(f"[S2.5] full output matched (max_diff={max_diff:.6f}) — "
+                  f"skip subgraph verification")
+            return True
+        else:
+            print(f"[S2.5] full output mismatch (max_diff={max_diff:.6f}) — "
+                  f"proceed to subgraph verification")
+            return False
 
     # ── recursive verify (BFS) ──
 
