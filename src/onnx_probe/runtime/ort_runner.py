@@ -2,6 +2,7 @@ import os
 import re
 import json
 import numpy as np
+import onnx
 import onnxruntime as ort
 
 
@@ -25,15 +26,40 @@ class ORTRunner:
             providers=providers,
         )
 
+        # 从 ONNX 模型提取输入的 elem_type，用于 dtype 转换
+        onnx_model = onnx.load(model_path)
+        self._input_elem_types = {}
+        for vi in onnx_model.graph.input:
+            self._input_elem_types[vi.name] = vi.type.tensor_type.elem_type
+
+    def _prepare_inputs(self, inputs):
+        """根据 session 的输入信息，从 inputs 中提取并转换为正确的 numpy 类型。"""
+        from onnx.mapping import TENSOR_TYPE_TO_NP_TYPE
+
+        prepared = {}
+        for inp in self.session.get_inputs():
+            if inp.name not in inputs:
+                continue
+            arr = np.asarray(inputs[inp.name])
+            elem_type = self._input_elem_types.get(inp.name)
+            if elem_type is not None:
+                expected = TENSOR_TYPE_TO_NP_TYPE[elem_type]
+                if arr.dtype != expected:
+                    arr = arr.astype(expected)
+            prepared[inp.name] = arr
+        return prepared
+
     def run(self, inputs, output_names=None):
         if output_names is None:
             output_names = [
                 x.name for x in self.session.get_outputs()
             ]
 
+        prepared = self._prepare_inputs(inputs)
+
         outputs = self.session.run(
             output_names,
-            inputs,
+            prepared,
         )
 
         return dict(zip(output_names, outputs))

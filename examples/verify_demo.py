@@ -35,7 +35,7 @@ def demo_dry_run():
         save_dir=save_dir,
         threshold=1e-3,
         min_nodes=20,
-        nodes_per_subgraph=100,
+        memory_budget_mb=512,
     )
 
     print(f"ONNX         : {onnx_path}")
@@ -88,8 +88,9 @@ def demo_real(onnx_path):
         save_dir=save_dir,
         threshold=1e-3,
         min_nodes=500,
-        nodes_per_subgraph=1000,
+        memory_budget_mb=512,
         verbose=True,
+        # input_dict={"input": np.load("real_input.npy")},  # 初始真值输入，不传则随机生成
     )
 
     t0 = time.time()

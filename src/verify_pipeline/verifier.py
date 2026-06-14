@@ -148,10 +148,11 @@ class TRTVerifier:
         trtexec_path=None,
         threshold=1e-3,
         min_nodes=500,
-        nodes_per_subgraph=1000,
+        nodes_per_subgraph=None,
         memory_budget_mb=512,
         precision="fp16",
         verbose=True,
+        input_dict=None,
     ):
         self.onnx_path = os.path.abspath(onnx_path)
         self.save_dir = save_dir
@@ -162,6 +163,7 @@ class TRTVerifier:
         self.memory_budget_mb = memory_budget_mb
         self.precision = precision
         self.verbose = verbose
+        self.input_dict = input_dict
 
         self._report = None
 
@@ -173,7 +175,7 @@ class TRTVerifier:
         gt_dir = os.path.join(self.save_dir, "ground_truth")
 
         # S1: full ONNX ORT dump
-        self._step_full_ort_dump(gt_dir)
+        self._step_full_ort_dump(gt_dir, self.input_dict)
 
         # S2: full ONNX → TRT + layer info
         full_layer_info = os.path.join(self.save_dir, "full_layers.json")
@@ -231,7 +233,7 @@ class TRTVerifier:
 
     # ── setup ──
 
-    def _step_full_ort_dump(self, gt_dir):
+    def _step_full_ort_dump(self, gt_dir, input_dict=None):
         os.makedirs(gt_dir, exist_ok=True)
 
         # remove stale dump files from previous runs
@@ -250,49 +252,78 @@ class TRTVerifier:
         else:
             builder.build(save_dir=gt_dir, memory_budget_mb=self.memory_budget_mb)
 
+        # ── 初始化 carry ──
         carry = {}
-        for inp in model.inputs:
-            shape = tuple(
-                d if isinstance(d, int) and d > 0 else 1 for d in inp.shape
-            )
-            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
-            carry[inp.name] = arr
+        if input_dict:
+            carry.update(input_dict)
+        else:
+            for inp in model.inputs:
+                shape = tuple(
+                    d if isinstance(d, int) and d > 0 else 1 for d in inp.shape
+                )
+                carry[inp.name] = (np.random.randn(*shape) * 0.02).astype(np.float32)
 
-            # save initial input to ground truth so subgraph verification can use it
-            safe = re.sub(r"[<>:\"/\\|?*\s]", "_", inp.name)
+        # 保存模型输入到 ground truth
+        for name, arr in carry.items():
+            safe = re.sub(r"[<>:\"/\\|?*\s]", "_", name)
             safe = re.sub(r"_+", "_", safe)
             np.save(os.path.join(gt_dir, f"{safe}.npy"), arr)
-            # update name_mapping.json
             map_path = os.path.join(gt_dir, "name_mapping.json")
             if os.path.exists(map_path):
                 with open(map_path, "r") as f:
                     mapping = json.load(f)
             else:
                 mapping = {}
-            mapping[inp.name] = f"{safe}.npy"
+            mapping[name] = f"{safe}.npy"
             with open(map_path, "w") as f:
                 json.dump(mapping, f, indent=2, ensure_ascii=False)
 
-        for dump_file in sorted(glob.glob(os.path.join(gt_dir, "dump_*.onnx"))):
+        dump_files = sorted(glob.glob(os.path.join(gt_dir, "dump_*.onnx")))
+
+        # 预扫描：每个子图需要哪些运行时输入（排除 initializer）
+        future_runtime_inputs = []
+        for df in dump_files:
+            sub = onnx.load(df)
+            init_names = {init.name for init in sub.graph.initializer}
+            runtime_inputs = {inp.name for inp in sub.graph.input if inp.name not in init_names}
+            future_runtime_inputs.append(runtime_inputs)
+
+        for i, dump_file in enumerate(dump_files):
             sub = onnx.load(dump_file)
             input_names = [inp.name for inp in sub.graph.input]
 
+            # 从 carry 中提取当前子图需要的输入
             inputs = {}
             for name in input_names:
-                if name not in carry:
+                if name in carry:
+                    inputs[name] = carry[name]
+                else:
+                    inits = {init.name: init for init in sub.graph.initializer}
+                    if name in inits:
+                        continue
                     raise KeyError(
                         f"missing boundary input '{name}' for "
                         f"{os.path.basename(dump_file)}"
                     )
-                inputs[name] = carry[name]
 
             runner = ORTRunner(dump_file)
             outputs = runner.dump(inputs, gt_dir)
             carry.update(outputs)
+
+            # 释放后续子图不再需要的 tensor
+            still_needed = set()
+            for j in range(i + 1, len(dump_files)):
+                still_needed |= future_runtime_inputs[j]
+            for name in list(carry.keys()):
+                if name not in still_needed:
+                    del carry[name]
+
             if self.verbose:
                 print(
                     f"[S1] {os.path.basename(dump_file)}: "
-                    f"{len(outputs)} tensors dumped"
+                    f"{len(outputs)} tensors dumped, "
+                    f"carry={len(carry)} tensors "
+                    f"({sum(v.nbytes for v in carry.values()) / 1024**2:.1f} MB)"
                 )
 
         print(f"[S1] ground truth ready: {gt_dir}")
