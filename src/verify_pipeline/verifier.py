@@ -173,6 +173,34 @@ def _parse_trt_export_output(json_path):
     return result
 
 
+def _compare_outputs(sub_onnx, gt_dir, trt_outputs):
+    """Compare subgraph TRT outputs against ground truth. Returns max_abs_diff."""
+    sub_model = onnx.load(sub_onnx)
+    output_names = {o.name for o in sub_model.graph.output}
+
+    with open(os.path.join(gt_dir, "name_mapping.json")) as f:
+        gt_mapping = json.load(f)
+
+    max_diff = 0.0
+    for out_name in output_names:
+        if out_name not in gt_mapping:
+            continue
+        onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
+
+        if out_name not in trt_outputs:
+            continue
+
+        trt_arr = trt_outputs[out_name]
+        if trt_arr.shape != onnx_arr.shape:
+            continue
+
+        diff = float(np.abs(onnx_arr.astype(np.float64) -
+                            trt_arr.astype(np.float64)).max())
+        max_diff = max(max_diff, diff)
+
+    return max_diff
+
+
 @dataclass
 class VerifyReport:
     passed: list = field(default_factory=list)
@@ -514,56 +542,72 @@ class TRTVerifier:
         os.makedirs(verify_dir, exist_ok=True)
 
         inputs_dir = os.path.join(verify_dir, "inputs")
-        trt_dump_dir = verify_dir  # trtexec --saveAllDebugTensors saves to cwd
+        trt_dump_dir = verify_dir
 
         sub_layer_info = os.path.join(verify_dir, "sub_layer_info.json")
 
-        # prepare inputs
-        mark_debug = node_count < self.min_nodes
+        # 叶子节点 → dump 所有中间 tensor 做逐层对比
+        # 非叶子节点 → 只 export 最终输出，判断是否需要继续递归
+        is_leaf = node_count < self.min_nodes
         input_spec = _build_input_spec(sub_onnx, gt_dir, inputs_dir, verify_dir,
                                        orig_onnx=self.onnx_path)
         load_inputs = dict(
             pair.split(":", 1) for pair in input_spec.split(",") if pair
         )
 
-        # build TRT engine + dump debug tensors
         builder = TRTBuilder(
             sub_onnx,
             precision=self.precision,
             trtexec_path=self.trtexec_path,
             export_layer_info=sub_layer_info,
-            mark_debug_tensors=mark_debug,
+            mark_debug_tensors=is_leaf,
             verbose=self.verbose,
         )
         builder.set_working_dir(verify_dir)
-        try:
-            builder.build(
-                load_inputs=load_inputs,
-                save_debug_tensors=True,
+
+        if is_leaf:
+            try:
+                builder.build(
+                    load_inputs=load_inputs,
+                    save_debug_tensors=True,
+                )
+            except RuntimeError as e:
+                report.errors.append({
+                    "depth": depth, "idx": idx,
+                    "subgraph": sub_onnx, "node_count": node_count,
+                    "error": str(e),
+                })
+                return False, {"depth": depth, "idx": idx, "node_count": node_count}
+
+            _build_trt_dump_mapping(trt_dump_dir, gt_dir=gt_dir)
+            mapper = LayerMapper(sub_onnx, sub_layer_info)
+            comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir)
+            result = comparator.compare()
+            comparator.save_report(os.path.join(verify_dir, "comparison.json"))
+            max_diff = max(
+                (r.get("max_abs_diff", 0) for r in result.rows), default=0
             )
-        except RuntimeError as e:
-            error_entry = {
-                "depth": depth, "idx": idx,
-                "subgraph": sub_onnx, "node_count": node_count,
-                "error": str(e),
-            }
-            report.errors.append(error_entry)
-            return False, error_entry
+            summary = result.summary
+        else:
+            # 非叶子节点：只导出最终输出判断是否匹配
+            export_output = os.path.join(verify_dir, "sub_output.json")
+            try:
+                builder.build(
+                    load_inputs=load_inputs,
+                    iterations=1,
+                    export_output=export_output,
+                )
+            except RuntimeError as e:
+                report.errors.append({
+                    "depth": depth, "idx": idx,
+                    "subgraph": sub_onnx, "node_count": node_count,
+                    "error": str(e),
+                })
+                return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
-        # map TRT debug tensor files
-        _build_trt_dump_mapping(trt_dump_dir, gt_dir=gt_dir)
-
-        # LayerMapper
-        mapper = LayerMapper(sub_onnx, sub_layer_info)
-
-        # LayerComparator
-        comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir)
-        result = comparator.compare()
-        comparator.save_report(os.path.join(verify_dir, "comparison.json"))
-
-        max_diff = max(
-            (r.get("max_abs_diff", 0) for r in result.rows), default=0
-        )
+            trt_outputs = _parse_trt_export_output(export_output)
+            max_diff = _compare_outputs(sub_onnx, gt_dir, trt_outputs)
+            summary = {"max_abs_diff": max_diff}
 
         entry = {
             "depth": depth,
@@ -571,7 +615,7 @@ class TRTVerifier:
             "subgraph": sub_onnx,
             "node_count": node_count,
             "max_abs_diff": max_diff,
-            "summary": result.summary,
+            "summary": summary,
             "sub_layer_info": sub_layer_info,
         }
 
