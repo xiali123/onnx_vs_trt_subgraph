@@ -2,6 +2,9 @@ import os
 import re
 import json
 import glob
+import logging
+import shutil
+from collections import deque
 import numpy as np
 import onnx
 from onnx import TensorProto
@@ -9,9 +12,10 @@ from dataclasses import dataclass, field
 
 from onnx_probe import GraphModel, AllTensorSelector, DumpBuilder, ORTRunner
 from trt_op import TRTBuilder
-from onnx_trt_map import LayerMapper
 from subgraph_split_by_trt import TRTPartitioner
 from compare_onnx_trt import LayerComparator
+
+logger = logging.getLogger("verify_pipeline")
 
 
 _ONNX_DTYPE_MAP = {
@@ -108,14 +112,17 @@ def _build_input_spec(subgraph_onnx, gt_dir, inputs_dir, trt_working_dir,
     return ",".join(spec_parts)
 
 
-def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
-    """Create name_mapping.json from --saveAllDebugTensors=numpy output.
-    Files are named {iter:04d}_{tensor_name}.npy — strip the iteration prefix.
-    Uses ground-truth name_mapping.json as reverse lookup to resolve TRT's
-    _-separated tensor names back to ONNX /-separated names."""
+_TRT_DUMP_PREFIX_RE = re.compile(r"^(\d{4,})_(.+)")
+
+def _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=None):
+    """Build {onnx_tensor_name: npy_filename} from TRT debug-tensor dump.
+
+    Does NOT write a file — returns the dict directly so callers can pass it
+    to LayerComparator without a disk round-trip.
+    """
     npy_files = sorted(f for f in os.listdir(trt_dump_dir) if f.endswith(".npy"))
 
-    # build reverse lookup: safe_name_stem → onnx_name
+    # reverse lookup: safe_name_stem → onnx_name
     safe_to_onnx = {}
     if gt_dir:
         gt_mapping_path = os.path.join(gt_dir, "name_mapping.json")
@@ -123,29 +130,28 @@ def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
             with open(gt_mapping_path) as f:
                 gt_mapping = json.load(f)
             for onnx_name, npy_file in gt_mapping.items():
-                safe_stem = os.path.splitext(npy_file)[0]
-                safe_to_onnx[safe_stem] = onnx_name
+                safe_to_onnx[os.path.splitext(npy_file)[0]] = onnx_name
 
     mapping = {}
     for f in npy_files:
         full_stem = os.path.splitext(f)[0]
-        # strip "{iter}_{tensor}" prefix only if result is a known ONNX tensor
-        m = re.match(r"^(\d{4,})_(.+)", full_stem)
+        m = _TRT_DUMP_PREFIX_RE.match(full_stem)
         if m and m.group(2) in safe_to_onnx:
             stem = m.group(2)
         else:
             stem = full_stem
 
-        # resolve via ground-truth reverse lookup first
         onnx_name = safe_to_onnx.get(stem)
         if onnx_name is None:
-            # fallback: try simple / → _ heuristic
-            if stem.startswith("_"):
-                onnx_name = "/" + stem[1:]
-            else:
-                onnx_name = stem
+            onnx_name = "/" + stem[1:] if stem.startswith("_") else stem
         mapping[onnx_name] = f
 
+    return mapping
+
+
+def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
+    """Write name_mapping.json and return its path (convenience wrapper)."""
+    mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir)
     path = os.path.join(trt_dump_dir, "name_mapping.json")
     with open(path, "w") as fh:
         json.dump(mapping, fh, indent=2, ensure_ascii=False)
@@ -273,8 +279,32 @@ class TRTVerifier:
 
     # ── public ──
 
+    def _setup_logging(self):
+        """Configure logger: console (level depends on *verbose*) + file (always DEBUG)."""
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+
+        # file handler — full trace written to save_dir/verify.log
+        fh = logging.FileHandler(
+            os.path.join(self.save_dir, "verify.log"), encoding="utf-8"
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)-7s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(fh)
+
+        # console handler
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO if self.verbose else logging.WARNING)
+        ch.setFormatter(logging.Formatter("[%(levelname)-7s] %(message)s"))
+        logger.addHandler(ch)
+
     def run(self):
         os.makedirs(self.save_dir, exist_ok=True)
+        self._setup_logging()
+        logger.info("verify pipeline start — %s", self.onnx_path)
 
         gt_dir = os.path.join(self.save_dir, "ground_truth")
 
@@ -422,15 +452,11 @@ class TRTVerifier:
                 if name not in still_needed:
                     del carry[name]
 
-            if self.verbose:
-                print(
-                    f"[S1] {os.path.basename(dump_file)}: "
-                    f"{len(outputs)} tensors dumped, "
-                    f"carry={len(carry)} tensors "
-                    f"({sum(v.nbytes for v in carry.values()) / 1024**2:.1f} MB)"
-                )
+            logger.debug("[S1] %s: %d tensors dumped, carry=%d tensors (%.1f MB)",
+                         os.path.basename(dump_file), len(outputs), len(carry),
+                         sum(v.nbytes for v in carry.values()) / 1024**2)
 
-        print(f"[S1] ground truth ready: {gt_dir}")
+        logger.info("[S1] ground truth ready: %s", gt_dir)
 
     def _step_full_trt_convert(self, layer_info_path):
         engine_path = os.path.join(os.path.dirname(layer_info_path),
@@ -463,7 +489,7 @@ class TRTVerifier:
             iterations=1,
             export_output=export_output,
         )
-        print(f"[S2] full TRT engine + layer info ready: {layer_info_path}")
+        logger.info("[S2] full TRT engine + layer info ready: %s", layer_info_path)
 
     # ── full-model output comparison ──
 
@@ -472,24 +498,29 @@ class TRTVerifier:
         Returns True if within threshold — skips subgraph split."""
         export_json = os.path.join(self.save_dir, "full_output.json")
         if not os.path.exists(export_json):
-            print(f"[S2.5] TRT output json not found: {export_json}")
+            logger.warning("[S2.5] TRT output json not found: %s", export_json)
             return False
 
-        trt_outputs = _parse_trt_export_output(export_json)
+        try:
+            trt_outputs = _parse_trt_export_output(export_json)
+        except Exception as e:
+            logger.warning("[S2.5] TRT output parse failed: %s", e)
+            return False
+
         max_diff, errors = _compare_outputs(self.onnx_path, gt_dir, trt_outputs, strict=True)
 
         for err in errors:
-            print(f"[S2.5] {err}")
+            logger.warning("[S2.5] %s", err)
         if errors:
             return False
 
         if max_diff <= self.threshold:
-            print(f"[S2.5] full output matched (max_diff={max_diff:.6f}) — "
-                  f"skip subgraph verification")
+            logger.info("[S2.5] full output matched (max_diff=%.6f) — "
+                        "skip subgraph verification", max_diff)
             return True
         else:
-            print(f"[S2.5] full output mismatch (max_diff={max_diff:.6f}) — "
-                  f"proceed to subgraph verification")
+            logger.info("[S2.5] full output mismatch (max_diff=%.6f) — "
+                        "proceed to subgraph verification", max_diff)
             return False
 
     # ── cleanup ──
@@ -499,7 +530,7 @@ class TRTVerifier:
         """Remove TRT artifacts from verify_dir to control disk usage.
 
         keep_layer_info=True  → keep sub_layer_info.json (needed for deeper split)
-        keep_dump=True        → keep .npy + .engine (leaf node failure debugging)
+        keep_dump=True        → keep .npy + .engine + comparison.json (leaf failure debugging)
         """
         if not os.path.isdir(verify_dir):
             return
@@ -516,12 +547,88 @@ class TRTVerifier:
             for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json"]:
                 for f in glob.glob(os.path.join(verify_dir, pattern)):
                     os.remove(f)
+            # comparison.json (regenerated at deeper levels if needed)
+            for f in glob.glob(os.path.join(verify_dir, "comparison.json")):
+                os.remove(f)
+            # input bin files (consumed by trtexec, no longer needed)
+            inputs_dir = os.path.join(verify_dir, "inputs")
+            if os.path.isdir(inputs_dir):
+                shutil.rmtree(inputs_dir, ignore_errors=True)
 
         if not keep_layer_info:
             for f in glob.glob(os.path.join(verify_dir, "sub_layer_info.json")):
                 os.remove(f)
             for f in glob.glob(os.path.join(verify_dir, "sub_output.json")):
                 os.remove(f)
+
+    # ── dataflow ordering ──
+
+    @staticmethod
+    def _dataflow_order(sub_onnx_files):
+        """Topological sort subgraphs by producer→consumer dataflow.
+
+        Returns list of (original_index, onnx_path, node_count) in dataflow order.
+        The models are loaded once here — callers can reuse the *node_count*
+        instead of loading the ONNX file a second time.
+        """
+        n = len(sub_onnx_files)
+
+        # 1) extract {outputs}, {inputs}, node_count per subgraph
+        outputs = []      # outputs[i] = set of tensor names produced
+        inputs = []       # inputs[i]  = set of external inputs needed
+        node_counts = []  # node_counts[i] = number of nodes
+        for path in sub_onnx_files:
+            model = onnx.load(path)
+            init_names = {init.name for init in model.graph.initializer}
+            produced = set()
+            consumed = set()
+            for node in model.graph.node:
+                for o in node.output:
+                    produced.add(o)
+                for inp in node.input:
+                    if inp not in init_names:
+                        consumed.add(inp)
+            outputs.append(produced)
+            inputs.append(consumed - produced)
+            node_counts.append(len(model.graph.node))
+
+        if n <= 1:
+            return [(0, sub_onnx_files[0], node_counts[0])] if n == 1 else []
+
+        # 2) tensor → index of subgraph that produces it
+        producer_of = {}
+        for i, prod in enumerate(outputs):
+            for t in prod:
+                producer_of[t] = i
+
+        # 3) build adjacency: i → j if subgraph j consumes a tensor produced by i
+        children = [[] for _ in range(n)]
+        indegree = [0] * n
+        for j in range(n):
+            for t in inputs[j]:
+                i = producer_of.get(t)
+                if i is not None and i != j:
+                    children[i].append(j)
+                    indegree[j] += 1
+
+        # 4) Kahn topological sort — roots first
+        queue = deque(i for i in range(n) if indegree[i] == 0)
+        order = []
+        while queue:
+            i = queue.popleft()
+            order.append((i, sub_onnx_files[i], node_counts[i]))
+            for j in children[i]:
+                indegree[j] -= 1
+                if indegree[j] == 0:
+                    queue.append(j)
+
+        # append any remaining (cycles or disconnected) in original order
+        seen = {i for i, _, _ in order}
+        for i in range(n):
+            if i not in seen:
+                order.append((i, sub_onnx_files[i], node_counts[i]))
+
+        return order
 
     # ── recursive verify (BFS) ──
 
@@ -531,25 +638,60 @@ class TRTVerifier:
         os.makedirs(split_dir, exist_ok=True)
 
         # A. partition
-        partitioner = TRTPartitioner(onnx_path, layer_info_path)
-        partitioner.split(save_dir=split_dir, nodes_per_subgraph=self.min_nodes)
+        try:
+            partitioner = TRTPartitioner(onnx_path, layer_info_path)
+            partitioner.split(save_dir=split_dir, nodes_per_subgraph=self.min_nodes)
+        except Exception as e:
+            logger.error("[verify:%d] partition failed: %s", depth, e)
+            report.errors.append({
+                "depth": depth,
+                "subgraph": onnx_path, "node_count": 0,
+                "error": f"partition failed: {e}",
+            })
+            return
 
         sub_onnx_files = sorted(glob.glob(os.path.join(split_dir, "subgraph_*.onnx")))
         if not sub_onnx_files:
-            print(f"[verify:{depth}] no subgraphs — done")
+            logger.info("[verify:%d] no subgraphs — done", depth)
             return
 
-        print(f"[verify:{depth}] {len(sub_onnx_files)} subgraphs to verify")
+        # dataflow-aware topological ordering
+        ordered = self._dataflow_order(sub_onnx_files)
+        logger.info("[verify:%d] %d subgraphs to verify (dataflow order)",
+                    depth, len(ordered))
 
         retry_list = []
 
-        # B. verify ALL subgraphs at this depth
-        for i, sub_onnx in enumerate(sub_onnx_files):
-            sub_model = onnx.load(sub_onnx)
-            node_count = len(sub_model.graph.node)
-            print(f"[verify:{depth}.{i}] {os.path.basename(sub_onnx)}: {node_count} nodes")
+        # B. verify ALL subgraphs at this depth (dataflow order)
+        for i, sub_onnx, node_count in ordered:
+            if node_count == 0:
+                try:
+                    sub_model = onnx.load(sub_onnx)
+                    node_count = len(sub_model.graph.node)
+                except Exception as e:
+                    logger.warning("[verify:%d.%d] SKIP — failed to load %s: %s",
+                                   depth, i, os.path.basename(sub_onnx), e)
+                    report.errors.append({
+                        "depth": depth, "idx": i,
+                        "subgraph": sub_onnx, "node_count": 0,
+                        "error": f"failed to load subgraph: {e}",
+                    })
+                    continue
 
-            passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report)
+            logger.info("[verify:%d.%d] %s: %d nodes",
+                        depth, i, os.path.basename(sub_onnx), node_count)
+
+            try:
+                passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report,
+                                                 node_count)
+            except Exception as e:
+                logger.error("[verify:%d.%d] ERROR — %s", depth, i, e)
+                report.errors.append({
+                    "depth": depth, "idx": i,
+                    "subgraph": sub_onnx, "node_count": node_count,
+                    "error": f"_verify_one crashed: {e}",
+                })
+                continue
 
             verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
                                       f"verify_sub_{i}")
@@ -558,7 +700,7 @@ class TRTVerifier:
                 report.passed.append(entry)
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
             elif node_count >= self.min_nodes:
-                print(f"[verify:{depth}.{i}] queued for deeper verification")
+                logger.info("[verify:%d.%d] queued for deeper verification", depth, i)
                 retry_list.append((sub_onnx, i))
                 # 非叶子：删除 npy/engine，保留 sub_layer_info 给更深层用
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=True)
@@ -580,16 +722,13 @@ class TRTVerifier:
                 # deeper verification done — parent's artifacts no longer needed
                 self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
             else:
-                print(f"[verify:{depth}] skip — no layer info for "
-                      f"{os.path.basename(sub_onnx)}")
+                logger.warning("[verify:%d] skip — no layer info for %s",
+                               depth, os.path.basename(sub_onnx))
 
     # ── verify single subgraph ──
 
-    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report):
+    def _verify_one(self, sub_onnx, gt_dir, depth, idx, report, node_count):
         """Verify one subgraph. Returns (passed: bool, entry: dict)."""
-        sub_model = onnx.load(sub_onnx)
-        node_count = len(sub_model.graph.node)
-
         verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
                                   f"verify_sub_{idx}")
         os.makedirs(verify_dir, exist_ok=True)
@@ -602,95 +741,95 @@ class TRTVerifier:
         # 叶子节点 → dump 所有中间 tensor 做逐层对比
         # 非叶子节点 → 只 export 最终输出，判断是否需要继续递归
         is_leaf = node_count < self.min_nodes
-        input_spec = _build_input_spec(sub_onnx, gt_dir, inputs_dir, verify_dir,
-                                       orig_onnx=self.onnx_path)
-        load_inputs = dict(
-            pair.split(":", 1) for pair in input_spec.split(",") if pair
-        )
+        try:
+            input_spec = _build_input_spec(sub_onnx, gt_dir, inputs_dir, verify_dir,
+                                           orig_onnx=self.onnx_path)
+            load_inputs = dict(
+                pair.split(":", 1) for pair in input_spec.split(",") if pair
+            )
+        except Exception as e:
+            logger.error("[verify:%d.%d] input spec build failed: %s", depth, idx, e)
+            report.errors.append({
+                "depth": depth, "idx": idx,
+                "subgraph": sub_onnx, "node_count": node_count,
+                "error": f"input spec build failed: {e}",
+            })
+            return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
         builder = TRTBuilder(
             sub_onnx,
             precision=self.precision,
             trtexec_path=self.trtexec_path,
             export_layer_info=sub_layer_info,
-            mark_debug_tensors=is_leaf,
+            mark_debug_tensors=True,
             verbose=self.verbose,
         )
         builder.set_working_dir(verify_dir)
 
-        comparator = None  # only set in leaf path; safe against NameError
+        # build TRT engine with debug tensors for per-layer comparison
+        try:
+            builder.build(
+                load_inputs=load_inputs,
+                save_debug_tensors=True,
+            )
+        except RuntimeError as e:
+            logger.error("[verify:%d.%d] TRT build failed: %s", depth, idx, e)
+            report.errors.append({
+                "depth": depth, "idx": idx,
+                "subgraph": sub_onnx, "node_count": node_count,
+                "error": str(e),
+            })
+            return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
-        if is_leaf:
-            try:
-                builder.build(
-                    load_inputs=load_inputs,
-                    save_debug_tensors=True,
-                )
-            except RuntimeError as e:
-                report.errors.append({
-                    "depth": depth, "idx": idx,
-                    "subgraph": sub_onnx, "node_count": node_count,
-                    "error": str(e),
-                })
-                return False, {"depth": depth, "idx": idx, "node_count": node_count}
-
-            _build_trt_dump_mapping(trt_dump_dir, gt_dir=gt_dir)
-            mapper = LayerMapper(sub_onnx, sub_layer_info)
-            comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir)
+        # per-layer comparison (both leaf and non-leaf)
+        try:
+            trt_mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=gt_dir)
+            comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir,
+                                         trt_mapping=trt_mapping)
             result = comparator.compare()
-            comparator.save_report(os.path.join(verify_dir, "comparison.json"))
+            comparison_path = comparator.save_report(
+                os.path.join(verify_dir, "comparison.json"))
+            logger.debug("[verify:%d.%d] comparison saved: %s (layers=%d, "
+                         "matched=%d, max_diff=%.6f)",
+                         depth, idx, os.path.basename(comparison_path or ""),
+                         len(result.rows), result.summary.get("compared", 0),
+                         result.summary.get("max_abs_diff", 0))
             max_diff = max(
                 (r.get("max_abs_diff", 0) for r in result.rows), default=0
             )
             summary = result.summary
-        else:
-            # 非叶子节点：只导出最终输出判断是否匹配
-            export_output = os.path.join(verify_dir, "sub_output.json")
-            try:
-                builder.build(
-                    load_inputs=load_inputs,
-                    iterations=1,
-                    export_output=export_output,
-                )
-            except RuntimeError as e:
-                report.errors.append({
-                    "depth": depth, "idx": idx,
-                    "subgraph": sub_onnx, "node_count": node_count,
-                    "error": str(e),
-                })
-                return False, {"depth": depth, "idx": idx, "node_count": node_count}
-
-            trt_outputs = _parse_trt_export_output(export_output)
-            max_diff, _ = _compare_outputs(sub_onnx, gt_dir, trt_outputs)
-            summary = {"max_abs_diff": max_diff}
+        except Exception as e:
+            logger.error("[verify:%d.%d] comparison failed: %s", depth, idx, e)
+            report.errors.append({
+                "depth": depth, "idx": idx,
+                "subgraph": sub_onnx, "node_count": node_count,
+                "error": f"comparison failed: {e}",
+            })
+            return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
         entry = {
             "depth": depth,
             "idx": idx,
             "subgraph": sub_onnx,
             "node_count": node_count,
+            "is_leaf": is_leaf,
             "max_abs_diff": max_diff,
             "summary": summary,
             "sub_layer_info": sub_layer_info,
+            "comparison": comparison_path,
         }
 
         if max_diff > self.threshold:
-            if node_count >= self.min_nodes:
-                print(
-                    f"[verify:{depth}.{idx}] max_abs_diff={max_diff:.6f} > "
-                    f"threshold, queue for re-split"
-                )
+            if not is_leaf:
+                logger.info("[verify:%d.%d] max_abs_diff=%.6f > threshold, "
+                            "queue for re-split", depth, idx, max_diff)
                 return False, entry
             else:
-                print(
-                    f"[verify:{depth}.{idx}] max_abs_diff={max_diff:.6f} > "
-                    f"threshold, record failed (leaf)"
-                )
+                logger.warning("[verify:%d.%d] max_abs_diff=%.6f > threshold, "
+                               "record failed (leaf)", depth, idx, max_diff)
                 entry["top_errors"] = comparator.result.top_errors(n=10)
                 return False, entry
         else:
-            print(
-                f"[verify:{depth}.{idx}] max_abs_diff={max_diff:.6f} <= "
-                f"threshold, passed"
-            )
+            logger.info("[verify:%d.%d] max_abs_diff=%.6f <= threshold, passed",
+                        depth, idx, max_diff)
             return True, entry

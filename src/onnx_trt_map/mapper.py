@@ -202,6 +202,8 @@ class LayerMapper:
         rows = self.to_rows()
         if path.endswith(".csv"):
             import csv
+            if not rows:
+                return path
             with open(path, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 w.writeheader()

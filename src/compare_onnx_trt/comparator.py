@@ -19,31 +19,54 @@ class CompareResult:
 
 
 class LayerComparator:
-    def __init__(self, onnx_path, trt_layer_path, onnx_dump_dir, trt_dump_dir):
+
+    _SAFE_RE_ILLEGAL = re.compile(r"[<>:\"/\\|?*\s]")
+    _SAFE_RE_COLLAPSE = re.compile(r"_+")
+
+    def __init__(self, onnx_path, trt_layer_path, onnx_dump_dir, trt_dump_dir,
+                 trt_mapping=None):
         self._mapper = LayerMapper(onnx_path, trt_layer_path)
 
-        # load name mappings
+        # load ONNX name mapping
         with open(os.path.join(onnx_dump_dir, "name_mapping.json")) as f:
-            self._onnx_map = json.load(f)   # tensor_name → npy_filename
-        with open(os.path.join(trt_dump_dir, "name_mapping.json")) as f:
-            self._trt_map = json.load(f)
+            self._onnx_map = json.load(f)
+
+        # TRT mapping: accept pre-built dict to skip disk round-trip
+        if trt_mapping is not None:
+            self._trt_map = trt_mapping
+        else:
+            with open(os.path.join(trt_dump_dir, "name_mapping.json")) as f:
+                self._trt_map = json.load(f)
 
         self._onnx_dir = onnx_dump_dir
         self._trt_dir = trt_dump_dir
+        self._npy_cache = {}  # path → array, avoids re-loading same file
+
+        # pre-build safe-name indexes for O(1) lookup (avoids O(n) scans)
+        self._onnx_safe_index = self._build_safe_index(self._onnx_map)
+        self._trt_safe_index = self._build_safe_index(self._trt_map)
+
+    @staticmethod
+    def _build_safe_index(name_map):
+        """{safe_name: original_name} — first-wins for O(1) safe-name resolution."""
+        idx = {}
+        for name in name_map:
+            safe = LayerComparator._safe_name(name)
+            idx.setdefault(safe, name)
+        return idx
 
     # ── name resolution helpers ──
 
     @staticmethod
     def _safe_name(tensor_name):
-        s = re.sub(r"[<>:\"/\\|?*\s]", "_", tensor_name)
-        return re.sub(r"_+", "_", s)
+        s = LayerComparator._SAFE_RE_ILLEGAL.sub("_", tensor_name)
+        return LayerComparator._SAFE_RE_COLLAPSE.sub("_", s)
 
     def _find_trt_dump(self, onnx_output_name, all_onnx_outputs):
         """Resolve TRT dump file for the ONNX tensor(s) produced by this layer.
 
-        Tries: exact onnx_output_name → safe-name → all ONNX outputs →
-        substring (preferring shortest match). Returns (filename, strategy, matched_key)
-        or (None, reason, "").
+        Tries: exact match → safe-name index (O(1)) → substring fallback.
+        Returns (filename, strategy, matched_key) or (None, reason, "").
         """
         candidates = [onnx_output_name] + [o for o in all_onnx_outputs if o != onnx_output_name]
 
@@ -52,18 +75,17 @@ class LayerComparator:
             if c in self._trt_map:
                 return self._trt_map[c], "exact", c
 
-        # 2) safe-name match
+        # 2) safe-name match via pre-built index — O(1)
         target_safe = self._safe_name(onnx_output_name)
-        for mapped_name, filename in self._trt_map.items():
-            mapped_safe = self._safe_name(mapped_name)
-            if target_safe == mapped_safe:
-                return filename, "safe_name", mapped_name
-            # also try safe names of all candidates
-            for c in candidates[1:]:
-                if self._safe_name(c) == mapped_safe:
-                    return filename, "safe_name", mapped_name
+        matched = self._trt_safe_index.get(target_safe)
+        if matched:
+            return self._trt_map[matched], "safe_name", matched
+        for c in candidates[1:]:
+            matched = self._trt_safe_index.get(self._safe_name(c))
+            if matched:
+                return self._trt_map[matched], "safe_name", matched
 
-        # 3) substring — prefer shortest match (less likely to be a false positive)
+        # 3) substring — last resort (O(n), but rarely reached)
         best = None
         for mapped_name, filename in self._trt_map.items():
             mapped_safe = self._safe_name(mapped_name)
@@ -76,7 +98,7 @@ class LayerComparator:
         return None, f"no_trt_dump (exact={onnx_output_name}, safe={target_safe})", ""
 
     def _find_onnx_dump(self, onnx_output_name, all_onnx_outputs):
-        """Resolve ONNX dump file. Tries: exact onnx_output_name → all node outputs → safe-name."""
+        """Resolve ONNX dump file. Tries: exact match → all node outputs → safe-name index."""
         # 1) exact match
         if onnx_output_name in self._onnx_map:
             return self._onnx_map[onnx_output_name], onnx_output_name
@@ -86,11 +108,11 @@ class LayerComparator:
             if o in self._onnx_map:
                 return self._onnx_map[o], o
 
-        # 3) safe-name fallback
+        # 3) safe-name via pre-built index — O(1)
         target_safe = self._safe_name(onnx_output_name)
-        for mapped_name, filename in self._onnx_map.items():
-            if self._safe_name(mapped_name) == target_safe:
-                return filename, mapped_name
+        matched = self._onnx_safe_index.get(target_safe)
+        if matched:
+            return self._onnx_map[matched], matched
 
         return None, ""
 
@@ -120,6 +142,17 @@ class LayerComparator:
                 "trt_output": onnx_output_name,
                 "onnx_nodes": ", ".join(o for n in onnx_nodes for o in n.output),
                 "onnx_ops": ", ".join(n.op_type for n in onnx_nodes),
+                "onnx_node_count": len(onnx_nodes),
+                "trt_parameter_type": layer.get("ParameterType", ""),
+                "trt_origin": layer.get("Origin", ""),
+                "trt_tactic": layer.get("TacticValue", ""),
+                "trt_inputs": ", ".join(inp.get("Name", "") for inp in layer.get("Inputs", [])),
+                "trt_input_dims": ", ".join(
+                    "x".join(str(d) for d in inp.get("Dimensions", []))
+                    for inp in layer.get("Inputs", [])),
+                "trt_output_dims": ", ".join(
+                    "x".join(str(d) for d in out.get("Dimensions", []))
+                    for out in layer.get("Outputs", [])),
             }
 
             if not onnx_output_name or not onnx_nodes:
@@ -148,15 +181,31 @@ class LayerComparator:
                 rows.append(row)
                 continue
 
-            # load and compare
-            trt_data = np.load(os.path.join(self._trt_dir, trt_file))
-            onnx_data = np.load(os.path.join(self._onnx_dir, onnx_file))
+            # load and compare (cached — same tensor may be referenced by multiple layers)
+            trt_path = os.path.join(self._trt_dir, trt_file)
+            onnx_path_full = os.path.join(self._onnx_dir, onnx_file)
+            trt_data = self._npy_cache.get(trt_path)
+            if trt_data is None:
+                trt_data = np.load(trt_path)
+                self._npy_cache[trt_path] = trt_data
+            onnx_data = self._npy_cache.get(onnx_path_full)
+            if onnx_data is None:
+                onnx_data = np.load(onnx_path_full)
+                self._npy_cache[onnx_path_full] = onnx_data
 
             if trt_data.shape != onnx_data.shape:
                 shape_mismatch += 1
-                row["status"] = "shape_mismatch"
-                row["trt_shape"] = str(trt_data.shape)
-                row["onnx_shape"] = str(onnx_data.shape)
+                row.update({
+                    "status": "shape_mismatch",
+                    "trt_shape": str(trt_data.shape),
+                    "onnx_shape": str(onnx_data.shape),
+                    "trt_dtype": str(trt_data.dtype),
+                    "onnx_dtype": str(onnx_data.dtype),
+                    "trt_elements": int(trt_data.size),
+                    "onnx_elements": int(onnx_data.size),
+                    "onnx_file": onnx_file,
+                    "trt_file": trt_file,
+                })
                 rows.append(row)
                 continue
 
@@ -185,9 +234,20 @@ class LayerComparator:
                 "allclose_1e-3": bool(np.allclose(trt_data, onnx_data, atol=1e-3)),
                 "allclose_1e-5": bool(np.allclose(trt_data, onnx_data, atol=1e-5)),
                 "shape": str(trt_data.shape),
+                "dtype": str(trt_data.dtype),
+                "num_elements": int(trt_data.size),
+                "trt_min": float(trt_flat.min()),
+                "trt_max": float(trt_flat.max()),
+                "trt_mean": float(trt_flat.mean()),
+                "onnx_min": float(onnx_flat.min()),
+                "onnx_max": float(onnx_flat.max()),
+                "onnx_mean": float(onnx_flat.mean()),
+                "onnx_file": onnx_file,
+                "trt_file": trt_file,
             })
             rows.append(row)
 
+        ok_rows = [r for r in rows if r.get("status") == "ok"]
         self._result = CompareResult(
             rows=rows,
             summary={
@@ -199,6 +259,9 @@ class LayerComparator:
                 "missing_onnx_dump": missing_onnx,
                 "allclose_1e-3": sum(1 for r in rows if r.get("allclose_1e-3", False)),
                 "allclose_1e-5": sum(1 for r in rows if r.get("allclose_1e-5", False)),
+                "max_abs_diff": max((r.get("max_abs_diff", 0) for r in ok_rows), default=0),
+                "mean_abs_diff": sum(r.get("mean_abs_diff", 0) for r in ok_rows) / max(len(ok_rows), 1),
+                "worst_layer": max(ok_rows, key=lambda r: r.get("max_abs_diff", 0)).get("trt_layer", "") if ok_rows else "",
             },
         )
         return self._result
@@ -211,10 +274,10 @@ class LayerComparator:
         if self._result is None:
             raise RuntimeError("Call compare() first")
         rows = self._result.rows
-        if not rows:
-            return
         if path.endswith(".csv"):
             import csv
+            if not rows:
+                return path
             with open(path, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 w.writeheader()
