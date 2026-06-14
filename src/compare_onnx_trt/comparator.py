@@ -231,9 +231,22 @@ class LayerComparator:
                 trt_flat = trt_data.ravel()
                 onnx_flat = onnx_data.ravel()
                 exact_match = bool(np.array_equal(trt_data, onnx_data))
-                mismatch_count = int(np.sum(trt_flat != onnx_flat))
+                mismatch_mask = trt_flat != onnx_flat
+                mismatch_count = int(np.sum(mismatch_mask))
                 max_ad = float(np.abs(trt_flat.astype(np.int64) -
                                        onnx_flat.astype(np.int64)).max())
+
+                # locate first mismatch position
+                mismatch_idx = np.where(mismatch_mask)[0]
+                first_mismatch_pos = (list(np.unravel_index(int(mismatch_idx[0]), trt_data.shape))
+                                      if len(mismatch_idx) > 0 and trt_data.ndim > 1
+                                      else [int(mismatch_idx[0])] if len(mismatch_idx) > 0
+                                      else [-1])
+                first_mismatch_trt = (int(trt_flat[mismatch_idx[0]])
+                                     if len(mismatch_idx) > 0 else 0)
+                first_mismatch_onnx = (int(onnx_flat[mismatch_idx[0]])
+                                      if len(mismatch_idx) > 0 else 0)
+
                 matched += 1
                 row.update({
                     "status": "ok",
@@ -254,6 +267,9 @@ class LayerComparator:
                     "onnx_max": int(onnx_flat.max()),
                     "onnx_mean": float(onnx_flat.mean()),
                     "mismatch_count": mismatch_count,
+                    "first_mismatch_position": first_mismatch_pos,
+                    "first_mismatch_trt_value": first_mismatch_trt,
+                    "first_mismatch_onnx_value": first_mismatch_onnx,
                     "onnx_file": onnx_file,
                     "trt_file": trt_file,
                 })
@@ -269,6 +285,13 @@ class LayerComparator:
 
             max_ad = float(abs_diff.max())
             mean_ad = float(abs_diff.mean())
+
+            # locate the element with the largest error
+            max_flat_idx = int(np.argmax(abs_diff))
+            max_pos = (list(np.unravel_index(max_flat_idx, trt_data.shape))
+                       if trt_data.ndim > 1 else [max_flat_idx])
+            max_trt_val = float(trt_flat[max_flat_idx])
+            max_onnx_val = float(onnx_flat[max_flat_idx])
 
             onnx_max = float(np.abs(onnx_data).max())
             rel_diff = max_ad / max(onnx_max, _EPSILON)
@@ -295,6 +318,9 @@ class LayerComparator:
                 "onnx_min": float(onnx_flat.min()),
                 "onnx_max": float(onnx_flat.max()),
                 "onnx_mean": float(onnx_flat.mean()),
+                "max_error_position": max_pos,
+                "max_error_trt_value": max_trt_val,
+                "max_error_onnx_value": max_onnx_val,
                 "onnx_file": onnx_file,
                 "trt_file": trt_file,
             })

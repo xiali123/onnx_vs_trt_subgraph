@@ -629,19 +629,23 @@ class TRTVerifier:
 
     @staticmethod
     def _selective_cleanup_npy(verify_dir, comparison_rows, threshold):
-        """Keep only npy files for layers whose error exceeds *threshold*.
+        """Keep npy files for problematic layers (error > threshold or bad status).
 
         Returns the set of preserved npy paths (for logging / cache info).
         """
-        # collect npy files referenced by bad layers
+        # collect npy files referenced by layers that need investigation
         bad_npy = set()
         for row in comparison_rows:
-            if row.get("max_abs_diff", 0) > threshold:
+            status = row.get("status", "")
+            max_diff = row.get("max_abs_diff", 0)
+            keep = (status != "ok" or                      # dtype_conflict, shape_mismatch, etc.
+                    max_diff > threshold)                   # exceeds tolerance
+            if keep:
                 trt_file = row.get("trt_file")
                 if trt_file:
                     bad_npy.add(os.path.join(verify_dir, trt_file))
 
-        # delete all npy files except bad ones
+        # delete all npy files except problematic ones
         total = 0
         kept = 0
         for f in glob.glob(os.path.join(verify_dir, "*.npy")):
@@ -657,7 +661,7 @@ class TRTVerifier:
                 os.remove(f)
 
         if total:
-            logger.debug("selective npy cleanup: kept %d/%d (max_abs_diff > %.1e)",
+            logger.debug("selective npy cleanup: kept %d/%d (errors + >%.1e)",
                          kept, total, threshold)
         return bad_npy
 
@@ -894,22 +898,23 @@ class TRTVerifier:
             })
             return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
+        # Only leaf nodes need debug tensors for per-layer comparison.
+        # Non-leaf nodes only need final output to decide whether to split further.
         builder = TRTBuilder(
             sub_onnx,
             precision=self.precision,
             trtexec_path=self.trtexec_path,
             export_layer_info=sub_layer_info,
-            mark_debug_tensors=True,
+            mark_debug_tensors=is_leaf,
             verbose=self.verbose,
         )
         builder.set_working_dir(verify_dir)
 
-        # build TRT engine: debug tensors (per-layer) + export output (final outputs)
         export_output = os.path.join(verify_dir, "sub_output.json")
         try:
             builder.build(
                 load_inputs=load_inputs,
-                save_debug_tensors=True,
+                save_debug_tensors=is_leaf,
                 export_output=export_output,
             )
         except RuntimeError as e:
@@ -921,35 +926,36 @@ class TRTVerifier:
             })
             return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
-        # per-layer comparison (intermediate tensors via debug dump)
-        try:
-            trt_mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=gt_dir)
-            comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir,
-                                         trt_mapping=trt_mapping)
-            result = comparator.compare()
-            comparison_path = comparator.save_report(
-                os.path.join(verify_dir, "comparison.json"))
-            logger.debug("[verify:%d.%d] comparison saved: %s (layers=%d, "
-                         "matched=%d, max_diff=%.6f)",
-                         depth, idx, os.path.basename(comparison_path or ""),
-                         len(result.rows), result.summary.get("compared", 0),
-                         result.summary.get("max_abs_diff", 0))
-            max_diff = max(
-                (r.get("max_abs_diff", 0) for r in result.rows), default=0
-            )
-            summary = result.summary
-
-            # leaf nodes: keep only npy files for layers above threshold
-            if is_leaf:
+        # per-layer comparison (only for leaf nodes with debug tensors)
+        summary = {}
+        comparison_path = None
+        max_diff = 0.0
+        if is_leaf:
+            try:
+                trt_mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=gt_dir)
+                comparator = LayerComparator(sub_onnx, sub_layer_info, gt_dir, trt_dump_dir,
+                                             trt_mapping=trt_mapping)
+                result = comparator.compare()
+                comparison_path = comparator.save_report(
+                    os.path.join(verify_dir, "comparison.json"))
+                logger.debug("[verify:%d.%d] comparison saved: %s (layers=%d, "
+                             "matched=%d, max_diff=%.6f)",
+                             depth, idx, os.path.basename(comparison_path or ""),
+                             len(result.rows), result.summary.get("compared", 0),
+                             result.summary.get("max_abs_diff", 0))
+                max_diff = max(
+                    (r.get("max_abs_diff", 0) for r in result.rows), default=0
+                )
+                summary = result.summary
                 self._selective_cleanup_npy(verify_dir, result.rows, self.threshold)
-        except Exception as e:
-            logger.error("[verify:%d.%d] comparison failed: %s", depth, idx, e)
-            report.errors.append({
-                "depth": depth, "idx": idx,
-                "subgraph": sub_onnx, "node_count": node_count,
-                "error": f"comparison failed: {e}",
-            })
-            return False, {"depth": depth, "idx": idx, "node_count": node_count}
+            except Exception as e:
+                logger.error("[verify:%d.%d] comparison failed: %s", depth, idx, e)
+                report.errors.append({
+                    "depth": depth, "idx": idx,
+                    "subgraph": sub_onnx, "node_count": node_count,
+                    "error": f"comparison failed: {e}",
+                })
+                return False, {"depth": depth, "idx": idx, "node_count": node_count}
 
         # final output comparison (network outputs may not be in debug tensors)
         output_max_diff = 0.0
