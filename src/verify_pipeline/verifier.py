@@ -111,9 +111,8 @@ def _build_trt_dump_mapping(trt_dump_dir, gt_dir=None):
     mapping = {}
     for f in npy_files:
         stem = os.path.splitext(f)[0]
-        # strip "0000_" prefix (4-digit iteration + underscore)
-        if len(stem) > 5 and stem[4] == "_" and stem[:4].isdigit():
-            stem = stem[5:]
+        # strip "{iter:04d}_{tensor}" prefix — iteration can be 4+ digits
+        stem = re.sub(r"^\d{4,}_", "", stem)
 
         # resolve via ground-truth reverse lookup first
         onnx_name = safe_to_onnx.get(stem)
@@ -478,6 +477,37 @@ class TRTVerifier:
                   f"proceed to subgraph verification")
             return False
 
+    # ── cleanup ──
+
+    @staticmethod
+    def _cleanup_verify_dir(verify_dir, keep_layer_info=True, keep_dump=False):
+        """Remove TRT artifacts from verify_dir to control disk usage.
+
+        keep_layer_info=True  → keep sub_layer_info.json (needed for deeper split)
+        keep_dump=True        → keep .npy + .engine (leaf node failure debugging)
+        """
+        if not os.path.isdir(verify_dir):
+            return
+
+        if not keep_dump:
+            # delete large artifacts: debug tensor dumps + engine
+            for f in glob.glob(os.path.join(verify_dir, "*.npy")):
+                os.remove(f)
+            for f in glob.glob(os.path.join(verify_dir, "*.engine")):
+                os.remove(f)
+            for f in glob.glob(os.path.join(verify_dir, "name_mapping.json")):
+                os.remove(f)
+            # trtexec profile artifacts
+            for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json"]:
+                for f in glob.glob(os.path.join(verify_dir, pattern)):
+                    os.remove(f)
+
+        if not keep_layer_info:
+            for f in glob.glob(os.path.join(verify_dir, "sub_layer_info.json")):
+                os.remove(f)
+            for f in glob.glob(os.path.join(verify_dir, "sub_output.json")):
+                os.remove(f)
+
     # ── recursive verify (BFS) ──
 
     def _verify(self, onnx_path, layer_info_path, gt_dir, depth, report):
@@ -506,26 +536,35 @@ class TRTVerifier:
 
             passed, entry = self._verify_one(sub_onnx, gt_dir, depth, i, report)
 
+            verify_dir = os.path.join(self.save_dir, f"depth_{depth}",
+                                      f"verify_sub_{i}")
+
             if passed:
                 report.passed.append(entry)
+                self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
             elif node_count >= self.min_nodes:
                 print(f"[verify:{depth}.{i}] queued for deeper verification")
                 retry_list.append(sub_onnx)
+                # 非叶子：删除 npy/engine，保留 sub_layer_info 给更深层用
+                self._cleanup_verify_dir(verify_dir, keep_layer_info=True)
             else:
                 report.failed.append(entry)
+                # 叶子失败：保留所有 npy + engine 用于排查
+                self._cleanup_verify_dir(verify_dir, keep_layer_info=True,
+                                         keep_dump=True)
 
         # C. BFS: recurse into all queued subgraphs
         for sub_onnx in retry_list:
-            # find the sub_layer_info from previous verification step
-            # convention: depth_{d}/verify_sub_{i}/sub_layer_info.json
-            sub_dir_entry = os.path.dirname(sub_onnx)
+            idx = sub_onnx_files.index(sub_onnx)
             verify_dir = os.path.join(
                 self.save_dir, f"depth_{depth}",
-                f"verify_sub_{sub_onnx_files.index(sub_onnx)}"
+                f"verify_sub_{idx}"
             )
             sub_layer_info = os.path.join(verify_dir, "sub_layer_info.json")
             if os.path.exists(sub_layer_info):
                 self._verify(sub_onnx, sub_layer_info, gt_dir, depth + 1, report)
+                # deeper verification done — parent's artifacts no longer needed
+                self._cleanup_verify_dir(verify_dir, keep_layer_info=False)
             else:
                 print(f"[verify:{depth}] skip — no layer info for "
                       f"{os.path.basename(sub_onnx)}")
