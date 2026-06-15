@@ -200,12 +200,11 @@ def _parse_trt_export_output(json_path):
     return result
 
 
-def _compare_outputs(sub_onnx, gt_dir, trt_outputs, strict=False):
+def _compare_outputs_detailed(sub_onnx, gt_dir, trt_outputs, strict=False):
     """Compare subgraph TRT outputs against ground truth.
 
-    Returns (max_abs_diff, errors) where errors is a list of description strings.
-    In strict mode missing outputs and shape mismatches are counted as errors;
-    in lenient mode they are silently skipped (useful for partial subgraphs).
+    Returns (max_abs_diff, errors, rows) where rows is a list of per-output
+    comparison dicts suitable for comparison.json.
     """
     sub_model = onnx.load(sub_onnx)
     output_names = {o.name for o in sub_model.graph.output}
@@ -215,16 +214,22 @@ def _compare_outputs(sub_onnx, gt_dir, trt_outputs, strict=False):
 
     max_diff = 0.0
     errors = []
-    for out_name in output_names:
+    rows = []
+    for out_name in sorted(output_names):
+        row = {"output_name": out_name}
         if out_name not in gt_mapping:
             if strict:
                 errors.append(f"ground truth missing for '{out_name}'")
+            row["status"] = "missing_ground_truth"
+            rows.append(row)
             continue
         onnx_arr = np.load(os.path.join(gt_dir, gt_mapping[out_name]))
 
         if out_name not in trt_outputs:
             if strict:
                 errors.append(f"TRT output '{out_name}' not found")
+            row["status"] = "missing_trt_output"
+            rows.append(row)
             continue
 
         trt_arr = trt_outputs[out_name]
@@ -232,12 +237,31 @@ def _compare_outputs(sub_onnx, gt_dir, trt_outputs, strict=False):
             if strict:
                 errors.append(f"shape mismatch for '{out_name}': "
                               f"TRT={trt_arr.shape} ONNX={onnx_arr.shape}")
+            row["status"] = "shape_mismatch"
+            row["ort_shape"] = str(onnx_arr.shape)
+            row["trt_shape"] = str(trt_arr.shape)
+            rows.append(row)
             continue
 
         diff = float(np.abs(onnx_arr.astype(np.float64) -
                             trt_arr.astype(np.float64)).max())
         max_diff = max(max_diff, diff)
+        row["status"] = "ok"
+        row["max_abs_diff"] = diff
+        row["ort_shape"] = str(onnx_arr.shape)
+        row["trt_shape"] = str(trt_arr.shape)
+        row["ort_dtype"] = str(onnx_arr.dtype)
+        row["trt_dtype"] = str(trt_arr.dtype)
+        rows.append(row)
 
+    return max_diff, errors, rows
+
+
+def _compare_outputs(sub_onnx, gt_dir, trt_outputs, strict=False):
+    """Compare subgraph TRT outputs against ground truth.
+    Returns (max_abs_diff, errors)."""
+    max_diff, errors, _ = _compare_outputs_detailed(
+        sub_onnx, gt_dir, trt_outputs, strict=strict)
     return max_diff, errors
 
 
@@ -596,11 +620,13 @@ class TRTVerifier:
     # ── cleanup ──
 
     @staticmethod
-    def _cleanup_verify_dir(verify_dir, keep_dump=False, keep_npy=None):
+    def _cleanup_verify_dir(verify_dir, keep_dump=False, keep_npy=None,
+                            keep_output=False):
         """Remove TRT artifacts from verify_dir to control disk usage.
 
-        keep_dump  → keep .npy + .engine (leaf failure debugging)
-        keep_npy   → set of npy paths to preserve even when keep_dump=False
+        keep_dump   → keep .npy + .engine (leaf failure debugging)
+        keep_npy    → set of npy paths to preserve even when keep_dump=False
+        keep_output → keep sub_output.json (when output errors are large)
         NOTE: comparison.json and sub_layer_info.json are NEVER deleted.
         """
         if not os.path.isdir(verify_dir):
@@ -619,9 +645,11 @@ class TRTVerifier:
         # metadata / temp files — always cleaned regardless of keep_dump
         for f in glob.glob(os.path.join(verify_dir, "name_mapping.json")):
             os.remove(f)
-        for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json",
-                        "sub_output.json"]:
+        for pattern in ["*.profile", "*.timing*", "timing_cache*", "graph_*.json"]:
             for f in glob.glob(os.path.join(verify_dir, pattern)):
+                os.remove(f)
+        if not keep_output:
+            for f in glob.glob(os.path.join(verify_dir, "sub_output.json")):
                 os.remove(f)
         inputs_dir = os.path.join(verify_dir, "inputs")
         if os.path.isdir(inputs_dir):
@@ -832,19 +860,25 @@ class TRTVerifier:
 
             # ── update cache ──
             cache_entry = {k: v for k, v in entry.items()
-                           if k not in ("top_errors",)}
+                           if k not in ("top_errors", "_bad_npy")}
+            bad_npy = entry.get("_bad_npy", set())
+            has_output_error = entry.get("output_max_diff",
+                                         0) is not None and entry.get(
+                "output_max_diff", 0) > self.threshold
             if passed:
                 report.passed.append(entry)
-                self._cleanup_verify_dir(verify_dir)
+                self._cleanup_verify_dir(verify_dir, keep_npy=bad_npy,
+                                         keep_output=has_output_error)
                 status = "passed"
             elif node_count >= self.min_nodes and can_split:
                 logger.info("[verify:%d.%d] queued for deeper verification", depth, i)
                 retry_list.append((sub_onnx, i))
-                self._cleanup_verify_dir(verify_dir)
+                self._cleanup_verify_dir(verify_dir, keep_output=has_output_error)
                 status = "queued"
             else:
                 report.failed.append(entry)
-                self._cleanup_verify_dir(verify_dir, keep_dump=True)
+                self._cleanup_verify_dir(verify_dir, keep_dump=True,
+                                         keep_output=True)
                 status = "failed"
 
             self._cache.setdefault("subgraphs", {})[cache_key] = {
@@ -930,6 +964,7 @@ class TRTVerifier:
         summary = {}
         comparison_path = None
         max_diff = 0.0
+        _bad_npy = set()
         if is_leaf:
             try:
                 trt_mapping = _build_trt_dump_mapping_dict(trt_dump_dir, gt_dir=gt_dir)
@@ -947,7 +982,8 @@ class TRTVerifier:
                     (r.get("max_abs_diff", 0) for r in result.rows), default=0
                 )
                 summary = result.summary
-                self._selective_cleanup_npy(verify_dir, result.rows, self.threshold)
+                _bad_npy = self._selective_cleanup_npy(verify_dir, result.rows,
+                                                       self.threshold)
             except Exception as e:
                 logger.error("[verify:%d.%d] comparison failed: %s", depth, idx, e)
                 report.errors.append({
@@ -959,10 +995,11 @@ class TRTVerifier:
 
         # final output comparison (network outputs may not be in debug tensors)
         output_max_diff = 0.0
+        output_details = {}
         if os.path.exists(export_output):
             try:
                 trt_outputs = _parse_trt_export_output(export_output)
-                output_max_diff, output_errors = _compare_outputs(
+                output_max_diff, output_errors, output_details = _compare_outputs_detailed(
                     sub_onnx, gt_dir, trt_outputs, strict=False)
                 summary["output_max_diff"] = output_max_diff
                 summary["output_errors"] = len(output_errors)
@@ -972,6 +1009,13 @@ class TRTVerifier:
                 summary["output_errors"] = 0
 
         max_diff = max(max_diff, output_max_diff)
+
+        # Non-leaf nodes: generate comparison.json from output comparison data
+        if not is_leaf and output_details:
+            comparison_path = os.path.join(verify_dir, "comparison.json")
+            with open(comparison_path, "w") as f:
+                json.dump({"summary": summary, "rows": output_details}, f,
+                          indent=2, ensure_ascii=False)
 
         entry = {
             "depth": depth,
@@ -984,6 +1028,7 @@ class TRTVerifier:
             "summary": summary,
             "sub_layer_info": sub_layer_info,
             "comparison": comparison_path,
+            "_bad_npy": _bad_npy,
         }
 
         if max_diff > self.threshold:
