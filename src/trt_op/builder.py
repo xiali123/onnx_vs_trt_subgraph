@@ -38,7 +38,7 @@ class TRTBuilder:
         onnx_path,
         engine_path=None,
         precision="fp16",
-        mempoolsize="workspace:2G",
+        mempoolsize="workspace:4G",
         builder_opt_level=3,
         verbose=True,
         trtexec_path=None,
